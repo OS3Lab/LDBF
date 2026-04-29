@@ -1,0 +1,4999 @@
+diff --git a/.gitignore b/.gitignore
+index 5e31de7b1..57a2a821c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,6 @@ executor/syscalls.h
+ 
+ # vscode
+ .vscode
++
++# Log files
++*.log
+\ No newline at end of file
+diff --git a/README.md b/README.md
+index a8c48e35f..f20eef93c 100644
+--- a/README.md
++++ b/README.md
+@@ -42,3 +42,41 @@ For other OS kernels check:
+ ## Disclaimer
+ 
+ This is not an official Google product.
++
++- Specify the path to the LDBF
++
++```
++export LDBF_DIR=/your_LDBF_path
++```
++
++- Specify the path of the generated eBPF program seeds
++
++```
++export LDBF_SEED_DIR=/your_path_of_eBPF_seeds
++```
++
++- Whether to enable debug information about LBPF syscall
++
++```
++export LDBF_DEBUG_BPF_INSN=1
++```
++
++- Whether to reuse the generated BPF instruction program
++
++```
++export LDBF_REUSE_BPF_INSN=1
++```
++
++- Whether to save the kernel dmesg info from QEMU VM
++
++```
++export LDBF_KERNEL_LOG_DIR=/your_path_to_save_kernel_vm_logs
++```
++
++- Set the path of vmlinux to get btf id
++
++```
++export LDBF_VMLINUX_PATH=/your_path_to_vmlinux
++```
++
++- For details on enabling syscalls, please refer to `sample.config`.
+\ No newline at end of file
+diff --git a/pkg/csource/csource.go b/pkg/csource/csource.go
+index d5da107b0..a7d4f5e28 100644
+--- a/pkg/csource/csource.go
++++ b/pkg/csource/csource.go
+@@ -701,3 +701,34 @@ func toCString(data []byte, readable bool) []byte {
+ 	prog.EncodeData(buf, data, readable)
+ 	return buf.Bytes()
+ }
++
++func ExtractBpfLoadInsnArg(p *prog.Prog, callIndex int) (string, error) {
++	csumSeq := 0
++	opts := Options{
++		Trace: false,
++	}
++	ctx := &context{
++		p:         p,
++		opts:      opts,
++		target:    p.Target,
++		sysTarget: targets.Get(p.Target.OS, p.Target.Arch),
++		calls:     make(map[string]uint64),
++	}
++
++	exec, err := p.SerializeForExec()
++	if err != nil {
++		return "", fmt.Errorf("failed to serialize program: %w", err)
++	}
++	decoded, err := ctx.target.DeserializeExec(exec, nil)
++	if err != nil {
++		return "", err
++	}
++
++	w := new(bytes.Buffer)
++	bpfSyscall := decoded.Calls[callIndex]
++	for _, copyin := range bpfSyscall.Copyin {
++		ctx.copyin(w, &csumSeq, copyin)
++	}
++
++	return w.String(), nil
++}
+diff --git a/pkg/fuzzer/fuzzer.go b/pkg/fuzzer/fuzzer.go
+index 17c5af47b..aa97b25fe 100644
+--- a/pkg/fuzzer/fuzzer.go
++++ b/pkg/fuzzer/fuzzer.go
+@@ -7,6 +7,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"math/rand"
++	"os"
+ 	"runtime"
+ 	"sort"
+ 	"sync"
+@@ -142,6 +143,19 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
+ 	// We do it before unblocking the waiting threads because
+ 	// it may result it concurrent modification of req.Prog.
+ 	var triage map[int]*triageCall
++
++	var bpfProg *prog.BpfProg
++	if req.Prog.Ldbf != nil {
++		bpfProg = req.Prog.Ldbf.GetLdbfBpfProg()
++	}
++	if bpfProg != nil && os.Getenv("LDBF_REUSE_BPF_INSN") == "" {
++		if bpfProgExecuated, _ := req.Prog.Ldbf.CheckBpfProgExecuated(bpfProg); !bpfProgExecuated {
++			_, err := req.Prog.Ldbf.MarkBpfProgAsExecuated(bpfProg)
++			if err != nil {
++				fmt.Printf("Error marking BPF program as executed: %v\n", err)
++			}
++		}
++	}
+ 	if req.ExecOpts.ExecFlags&flatrpc.ExecFlagCollectSignal > 0 && res.Info != nil && !dontTriage {
+ 		for call, info := range res.Info.Calls {
+ 			fuzzer.triageProgCall(req.Prog, info, call, &triage)
+@@ -284,6 +298,7 @@ func (fuzzer *Fuzzer) genFuzz() *queue.Request {
+ 	if req == nil {
+ 		req = genProgRequest(fuzzer, rnd)
+ 	}
++	fuzzer.Config.Collide = false
+ 	if fuzzer.Config.Collide && rnd.Intn(3) == 0 {
+ 		req = &queue.Request{
+ 			Prog: randomCollide(req.Prog, rnd),
+diff --git a/pkg/fuzzer/job.go b/pkg/fuzzer/job.go
+index 7f1e47bf6..61b1e1ed1 100644
+--- a/pkg/fuzzer/job.go
++++ b/pkg/fuzzer/job.go
+@@ -7,6 +7,7 @@ import (
+ 	"bytes"
+ 	"fmt"
+ 	"math/rand"
++	"os"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -14,6 +15,7 @@ import (
+ 
+ 	"github.com/google/syzkaller/pkg/corpus"
+ 	"github.com/google/syzkaller/pkg/cover"
++	"github.com/google/syzkaller/pkg/csource"
+ 	"github.com/google/syzkaller/pkg/flatrpc"
+ 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+ 	"github.com/google/syzkaller/pkg/signal"
+@@ -161,12 +163,40 @@ func (job *triageJob) run(fuzzer *Fuzzer) {
+ 	wg.Wait()
+ }
+ 
++func handleBpfLoadCallInsn(p *prog.Prog, call int, isBpfRaw bool) {
++	bpfProgArgC, err := csource.ExtractBpfLoadInsnArg(p, call)
++	if err != nil {
++		fmt.Printf("failed to extract bpf load insn arg: %v\n", err)
++	} else {
++		p.Ldbf.ExtBpfProgLoadCallInsn(call, p, bpfProgArgC, isBpfRaw)
++	}
++}
++
++func handleBpfLoadCall(p *prog.Prog, call int) {
++	if os.Getenv("LDBF_DEBUG_BPF_INSN") == "" {
++		return
++	}
++	var bpfProg *prog.BpfProg
++	if p.Ldbf != nil {
++		bpfProg = p.Ldbf.GetLdbfBpfProg()
++	}
++	if bpfProg == nil || bpfProg.BpfRawInsnExtracted {
++		return
++	}
++	if p.CallName(call) == "bpf$LDBF_PROG_LOAD" {
++		handleBpfLoadCallInsn(p, call, false)
++	} else if p.CallName(call) == "bpf$PROG_LOAD" {
++		handleBpfLoadCallInsn(p, call, true)
++	}
++}
++
+ func (job *triageJob) handleCall(call int, info *triageCall) {
+ 	if info.newStableSignal.Empty() {
+ 		return
+ 	}
+ 
+ 	p := job.p
++	handleBpfLoadCall(p, call)
+ 	if job.flags&ProgMinimized == 0 {
+ 		p, call = job.minimize(call, info)
+ 		if p == nil {
+diff --git a/prog/generation.go b/prog/generation.go
+index 09240e858..b9b98e73f 100644
+--- a/prog/generation.go
++++ b/prog/generation.go
+@@ -15,13 +15,14 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
+ 	}
+ 	r := newRand(target, rs)
+ 	s := newState(target, ct, nil)
+-	for len(p.Calls) < ncalls {
+-		calls := r.generateCall(s, p, len(p.Calls))
+-		for _, c := range calls {
+-			s.analyze(c)
+-			p.Calls = append(p.Calls, c)
+-		}
+-	}
++	p.initLDBP(r, s)
++	// for len(p.Calls) < ncalls {
++	// 	calls := r.generateCall(s, p, len(p.Calls))
++	// 	for _, c := range calls {
++	// 		s.analyze(c)
++	// 		p.Calls = append(p.Calls, c)
++	// 	}
++	// }
+ 	// For the last generated call we could get additional calls that create
+ 	// resources and overflow ncalls. Remove some of these calls.
+ 	// The resources in the last call will be replaced with the default values,
+diff --git a/prog/ldbf.go b/prog/ldbf.go
+new file mode 100644
+index 000000000..f99ae7cd8
+--- /dev/null
++++ b/prog/ldbf.go
+@@ -0,0 +1,192 @@
++package prog
++
++import (
++	"fmt"
++	"os"
++	"sync"
++)
++
++type LLMDrivenBPFuzzer struct {
++	isEnabled bool
++	LDBFDir   string
++	bpfProg   *BpfProg
++}
++
++var LdbfRecordSyscalls = []string{
++	"bpf$LDBF_MAP_CREATE",
++	"bpf$LDBF_PROG_LOAD",
++	"bpf$LDBF_BPF_PROG_ATTACH",
++	"bpf$LDBF_BPF_PROG_TEST_RUN",
++	"bpf$LDBF_BPF_BTF_LOAD",
++	"bpf$LDBF_LINK_CREATE",
++}
++
++var LdbfRecordSyscallsSet = make(map[string]struct{})
++
++func initLdbfRecordSyscallsSet() {
++	for _, syscall := range LdbfRecordSyscalls {
++		LdbfRecordSyscallsSet[syscall] = struct{}{}
++	}
++}
++
++// IsMapTypeValid checks if a string is a valid map type using a pre-built hash set.
++func (Ldbf *LLMDrivenBPFuzzer) IsLdbfRecordSyscall(s string) bool {
++	_, ok := LdbfRecordSyscallsSet[s]
++	return ok
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) LogLdbfRecordSyscall() {
++	for _, syscall := range LdbfRecordSyscalls {
++		fmt.Printf("LogLdbfRecordSyscall: Recording syscall: %s\n", syscall)
++	}
++}
++
++// performInitialCleanup contains all initialization cleanup work that should only be performed once
++func performInitialCleanup() {
++	if loraCorpusDir, err := JoinLdbfLoraDir("corpus"); err == nil {
++		if err := os.RemoveAll(loraCorpusDir); err != nil {
++			// fmt.Printf("Warning: failed to remove directory %s: %v\n", loraCorpusDir, err)
++		}
++	} else {
++		// fmt.Printf("Warning: could not get corpus directory for cleanup: %v\n", err)
++	}
++
++	if loraExecuatedDir, err := GetExecuatedDir(); err == nil {
++		if err := os.RemoveAll(loraExecuatedDir); err != nil {
++			// fmt.Printf("Warning: failed to remove directory %s: %v\n", loraExecuatedDir, err)
++		}
++	} else {
++		// fmt.Printf("Warning: could not get execuated directory for cleanup: %v\n", err)
++	}
++}
++
++func initializeLdbf() {
++	performInitialCleanup()
++	initLdbfProgTypeMap()
++	initLdbfRecordSyscallsSet()
++	initBtfMap()
++}
++
++var ldbfInitOnce sync.Once
++
++func NewLLMDrivenBPFFuzzer(enable bool) *LLMDrivenBPFuzzer {
++	if !enable {
++		fmt.Println("LLMDrivenBPFuzzer is not enabled")
++		return nil
++	}
++
++	LDBFDir := os.Getenv("LDBF_DIR") + "/"
++	if LDBFDir == "/" {
++		panic("LDBF_DIR environment variable is not set")
++	}
++
++	Ldbf := &LLMDrivenBPFuzzer{
++		isEnabled: true,
++		LDBFDir:   LDBFDir,
++	}
++
++	ldbfInitOnce.Do(initializeLdbf)
++
++	return Ldbf
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) LdbfIsEnabled() bool {
++	return Ldbf.isEnabled
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) GenLdbfPrologue(r *randGen, s *state, p *Prog) {
++	var bpfProg *BpfProg
++
++	if !Ldbf.isEnabled {
++		return
++	}
++
++	bpfProg = Ldbf.genSeedLdbfProg(r)
++	if bpfProg == nil {
++		// fmt.Println("Ldbf: Failed to generate seed BPF program")
++		return
++	}
++
++	btfCalls := Ldbf.genLdbfBtfLoadCall(r, s, bpfProg)
++	for _, c := range btfCalls {
++		s.analyze(c)
++		p.Calls = append(p.Calls, c)
++	}
++
++	mapcalls := Ldbf.genLdbfMapCreateCall(r, s, bpfProg)
++	for _, c := range mapcalls {
++		s.analyze(c)
++		p.Calls = append(p.Calls, c)
++	}
++
++	c0s := Ldbf.genLdbfProgLoadCall(r, s, bpfProg)
++	for _, c := range c0s {
++		s.analyze(c)
++		p.Calls = append(p.Calls, c)
++	}
++	Ldbf.bpfProg = bpfProg
++
++	var c1 *Call
++	for _, c := range c0s {
++		c1 = c
++		bpfProg.BpfProgContext.ProgFD = c1.Ret
++		break
++	}
++
++	// fmt.Println("create link_create call")
++	linkCalls := Ldbf.genLdbfAttachCalls(r, s, bpfProg)
++	for _, c := range linkCalls {
++		s.analyze(c)
++		p.Calls = append(p.Calls, c)
++	}
++	// fmt.Println("finish creating")
++
++	c2s := Ldbf.genLdbfProgTestRunCall(r, s, bpfProg)
++	for _, c := range c2s {
++		s.analyze(c)
++		p.Calls = append(p.Calls, c)
++	}
++
++	// fmt.Printf(("Ldbf: GenLdbfPrologue: req.Prog:%p, BpfProgFilePath: %s\n"), p, bpfProg.BpfProgFilePath)
++	// fmt.Printf(("Ldbf: GenLdbfPrologue: BpfRawInsnFilePath: %s\n"), BpfProg.BpfRawInsnFilePath)
++	// fmt.Printf(("Ldbf: GenLdbfPrologue: BpfRawInsnString: %s\n"), BpfProg.BpfRawInsnString)
++	// p.debugValidate()
++	// fmt.Printf("Ldbf: GenLdbfPrologue: generating program:\n%s\n", p.Serialize())
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genSeedLdbfProg(r *randGen) *BpfProg {
++	var opt BrfGenProgOpt
++	var bpfProg *BpfProg
++	var ok bool
++
++	opt.useTestSrc = true
++	opt.genProgAttempt = 5
++
++	for i := 0; i < opt.genProgAttempt; i++ {
++		if bpfProg, ok = Ldbf.genLdbfProg(r, opt); !ok {
++			continue
++		}
++
++		bpfProg = TranslateBpfProg(bpfProg)
++		if bpfProg.BpfRawInsnFilePath != "" {
++			bpfProg = FillExtractBpfRawInsn(bpfProg)
++			if bpfProg.BpfRawInsnString != "" {
++				return bpfProg
++			}
++		} else {
++			// fmt.Printf("Failed to compile bpf program\n")
++		}
++	}
++	return nil
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfProg(r *randGen, opt BrfGenProgOpt) (*BpfProg, bool) {
++	bpfProg := Ldbf.NewLdbfProg(r, opt)
++
++	if bpfProg == nil {
++		// fmt.Println("Ldbf: Failed to generate BPF program")
++		return nil, false
++	}
++
++	return bpfProg, true
++}
+diff --git a/prog/ldbf_attach.go b/prog/ldbf_attach.go
+new file mode 100644
+index 000000000..0c1975bc0
+--- /dev/null
++++ b/prog/ldbf_attach.go
+@@ -0,0 +1,574 @@
++package prog
++
++const (
++	CGroupFd int = 0
++	MapFd    int = 1
++	IfIndex  int = 2
++	FallBack int = 3
++)
++
++const (
++	BPF_CGROUP_INET_INGRESS            int = 0x0
++	BPF_CGROUP_INET_EGRESS             int = 0x1
++	BPF_CGROUP_INET_SOCK_CREATE        int = 0x2
++	BPF_CGROUP_SOCK_OPS                int = 0x3
++	BPF_SK_SKB_STREAM_PARSER           int = 0x4
++	BPF_SK_SKB_STREAM_VERDICT          int = 0x5
++	BPF_CGROUP_DEVICE                  int = 0x6
++	BPF_SK_MSG_VERDICT                 int = 0x7
++	BPF_CGROUP_INET4_BIND              int = 0x8
++	BPF_CGROUP_INET6_BIND              int = 0x9
++	BPF_CGROUP_INET4_CONNECT           int = 0xa
++	BPF_CGROUP_INET6_CONNECT           int = 0xb
++	BPF_CGROUP_INET4_POST_BIND         int = 0xc
++	BPF_CGROUP_INET6_POST_BIND         int = 0xd
++	BPF_CGROUP_UDP4_SENDMSG            int = 0xe
++	BPF_CGROUP_UDP6_SENDMSG            int = 0xf
++	BPF_LIRC_MODE2                     int = 0x10
++	BPF_FLOW_DISSECTOR                 int = 0x11
++	BPF_CGROUP_SYSCTL                  int = 0x12
++	BPF_CGROUP_UDP4_RECVMSG            int = 0x13
++	BPF_CGROUP_UDP6_RECVMSG            int = 0x14
++	BPF_CGROUP_GETSOCKOPT              int = 0x15
++	BPF_CGROUP_SETSOCKOPT              int = 0x16
++	BPF_TRACE_RAW_TP                   int = 0x17
++	BPF_TRACE_FENTRY                   int = 0x18
++	BPF_TRACE_FEXIT                    int = 0x19
++	BPF_MODIFY_RETURN                  int = 0x1a
++	BPF_LSM_MAC                        int = 0x1b
++	BPF_TRACE_ITER                     int = 0x1c
++	BPF_CGROUP_INET4_GETPEERNAME       int = 0x1d
++	BPF_CGROUP_INET6_GETPEERNAME       int = 0x1e
++	BPF_CGROUP_INET4_GETSOCKNAME       int = 0x1f
++	BPF_CGROUP_INET6_GETSOCKNAME       int = 0x20
++	BPF_XDP_DEVMAP                     int = 0x21
++	BPF_CGROUP_INET_SOCK_RELEASE       int = 0x22
++	BPF_XDP_CPUMAP                     int = 0x23
++	BPF_SK_LOOKUP                      int = 0x24
++	BPF_XDP                            int = 0x25
++	BPF_SK_SKB_VERDICT                 int = 0x26
++	BPF_SK_REUSEPORT_SELECT            int = 0x27
++	BPF_SK_REUSEPORT_SELECT_OR_MIGRATE int = 0x28
++	BPF_PERF_EVENT                     int = 0x29
++	BPF_TRACE_KPROBE_MULTI             int = 0x2a
++	BPF_LSM_CGROUP                     int = 0x2b
++	BPF_STRUCT_OPS                     int = 0x2c
++	BPF_NETFILTER                      int = 0x2d
++	BPF_TCX_INGRESS                    int = 0x2e
++	BPF_TCX_EGRESS                     int = 0x2f
++	BPF_TRACE_UPROBE_MULTI             int = 0x30
++	BPF_CGROUP_UNIX_CONNECT            int = 0x31
++	BPF_CGROUP_UNIX_SENDMSG            int = 0x32
++	BPF_CGROUP_UNIX_RECVMSG            int = 0x33
++	BPF_CGROUP_UNIX_GETPEERNAME        int = 0x34
++	BPF_CGROUP_UNIX_GETSOCKNAME        int = 0x35
++	BPF_NETKIT_PRIMARY                 int = 0x36
++	BPF_NETKIT_PEER                    int = 0x37
++	BPF_TRACE_KPROBE_SESSION           int = 0x38
++	BPF_TRACE_UPROBE_SESSION           int = 0x39
++	__MAX_BPF_ATTACH_TYPE              int = 0x3a
++)
++
++const (
++	BTF       int = 0
++	Iter      int = 1
++	Perf      int = 2
++	Kprobe    int = 3
++	Trace     int = 4
++	Netfilter int = 5
++	Tcx       int = 6
++	Uprobe    int = 7
++	Netkit    int = 8
++)
++
++var Sockets = []string{
++	"socket$inet_udp",
++	"socket$inet_udplite",
++	"socket$inet6_udp",
++	"socket$inet6_udplite",
++	"socket$inet_mptcp",
++	"socket$inet_tcp",
++	"socket$inet6_mptcp",
++	"socket$inet6_tcp",
++	"socket$inet",
++}
++
++type ProgAttachContext struct {
++	Flags      int
++	TargetType int
++	TargetFd   *ResultArg
++	ExtraType  int
++	Extra      interface{}
++}
++
++type NetfilterExtra struct {
++	Pf       int32 // flags[nfproto, int32]
++	Hooknum  int32 // flags[nf_dev_hooks, int32]
++	Priority int32
++	Flags    int32 // flags[bpf_link_create_netfilter_flags, int32]
++}
++
++type TracingExtra struct {
++	target_btf_id int32
++	cookie        uint64
++}
++
++func makeExtraArg(r *randGen, s *state, targetType int, extraType Type, extraData interface{}) *GroupArg {
++	switch targetType {
++	case Netfilter:
++		return makeNetfilterArg(r, s, extraType, extraData.(NetfilterExtra))
++	case Trace:
++		return makeTracingArg(r, s, extraType, extraData.(TracingExtra))
++
++	}
++	return nil
++}
++
++func makeTracingArg(r *randGen, s *state, tracetype Type, tracedata TracingExtra) *GroupArg {
++	args := []Arg{}
++	for idx, field := range tracetype.(*StructType).Fields {
++		var newArg Arg
++		switch idx {
++		case 0: // target_btf_id - int32
++			newArg = MakeConstArg(field.Type, DirIn, uint64(tracedata.target_btf_id))
++		case 1: // cookie - uint64
++			newArg = MakeConstArg(field.Type, DirIn, uint64(tracedata.cookie))
++		}
++
++		args = append(args, newArg)
++	}
++
++	return MakeGroupArg(tracetype, DirIn, args)
++
++}
++
++func makeNetfilterArg(r *randGen, s *state, nettype Type, netdata NetfilterExtra) *GroupArg {
++	args := []Arg{}
++	for idx, field := range nettype.(*StructType).Fields {
++		var newArg Arg
++		switch idx {
++		case 0: // pf - flags[nfproto, int32]
++			newArg = MakeConstArg(field.Type, DirIn, uint64(netdata.Pf))
++		case 1: // hooknum - flags[nf_dev_hooks, int32]
++			newArg = MakeConstArg(field.Type, DirIn, uint64(netdata.Hooknum))
++		case 2: // priority - int32
++			newArg = MakeConstArg(field.Type, DirIn, uint64(netdata.Priority))
++		case 3: // flags - flags[bpf_link_create_netfilter_flags, int32]
++			newArg = MakeConstArg(field.Type, DirIn, uint64(netdata.Flags))
++
++		}
++
++		args = append(args, newArg)
++	}
++
++	return MakeGroupArg(nettype, DirIn, args)
++
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfProgAttachCall(r *randGen, s *state, bpfProg *BpfProg, attachContext *ProgAttachContext) (calls []*Call) {
++	// use bpf$LDBF_BPF_PROG_ATTACH to attach ebpf prog to its target
++	var currentProgAttachCall []*Call
++	meta := r.target.SyscallMap["bpf$LDBF_BPF_PROG_ATTACH"]
++	c := MakeCall(meta, nil)
++	c.Args, calls = r.generateArgs(s, meta.Args, DirIn)
++
++	cArgField, _ := c.Args[1].Type().(*PtrType)
++	linkCreateTypes, _ := cArgField.Elem.(*StructType)
++
++	// bpf_link_create_arg
++	ptrArg, ok := c.Args[1].(*PointerArg)
++	if !ok {
++		return currentProgAttachCall
++	}
++	//bpf_link_create_arg_t
++	linkCreateArgs, ok := ptrArg.Res.(*GroupArg)
++	if !ok || ptrArg.Res == nil {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a PointerArg, got %T\n", c.Args[1])
++		return currentProgAttachCall
++	}
++
++	for argIdx, field := range linkCreateTypes.Fields {
++		var newArg Arg
++		switch argIdx {
++		case 0: // target_fd
++			// calls := Ldbf.createAttachedTarget(r, s, bpfProg)
++			// if len(calls) == 0 {
++			// 	fmt.Println("Ldbf: genLdbfProgLinkCall: failed to create attach target")
++			// 	continue
++			// }
++			// currentLinkCreateCall = append(currentLinkCreateCall, calls...)
++			targetTypes := field.Type.(*UnionType)
++			//fmt.Println(targetTypes)
++
++			targetType := targetTypes.Fields[attachContext.TargetType]
++			// fmt.Println("Target type:", targetType)
++			fd := attachContext.TargetFd
++			fdArg := MakeResultArg(targetType.Type, DirIn, fd, 0)
++			newArg = MakeUnionArg(targetTypes, DirIn, fdArg, attachContext.TargetType)
++
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		case 1: // prog_fd
++			newArg = MakeResultArg(field.Type, DirIn, bpfProg.BpfProgContext.ProgFD, 0)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		case 2: // attach_type
++			newArg = MakeConstArg(field.Type, DirIn, bpfProg.BpfProgContext.ExpectedAttachType)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		case 3: // flags
++			newArg = MakeConstArg(field.Type, DirIn, 0)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		case 4:
++			newArg = MakeResultArg(field.Type, DirIn, nil, 0)
++			// fmt.Println("newArg:", newArg, " type:", field.Type)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		// case 5, 6, 7, 8:
++		// 	sourceArg := MakeResultArg(field.Type, DirIn, nil, 0)
++		// 	newArg = MakeUnionArg()
++		// 	replaceArg(linkCreateArgs.Inner[argIdx], sourceArg)
++		default:
++
++		}
++	}
++	//moreCalls, _ := r.patchConditionalFields(c, s)
++	r.target.assignSizesCall(c)
++	return append(append(calls, currentProgAttachCall...), c)
++
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfAttachCalls(r *randGen, s *state, bpfProg *BpfProg) (calls []*Call) {
++	var bpfAttachCalls []*Call
++	progType := bpfProg.BpfProgContext.ProgType
++	//attachType := bpfProg.BpfProgContext.ExpectedAttachType
++	var attachContext ProgAttachContext
++	switch progType {
++	case BPF_PROG_TYPE_CGROUP_SKB, BPF_PROG_TYPE_CGROUP_SOCK, BPF_PROG_TYPE_CGROUP_DEVICE,
++		BPF_PROG_TYPE_CGROUP_SOCK_ADDR, BPF_PROG_TYPE_CGROUP_SYSCTL, BPF_PROG_TYPE_CGROUP_SOCKOPT,
++		BPF_PROG_TYPE_SOCK_OPS:
++		call := genOpenCall(r, s, "/sys/fs/cgroup", 0, 0)
++		attachContext.TargetFd = call.Ret
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, call)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++		bpfAttachCalls = append(bpfAttachCalls, genRandCalls(r, s, bpfProg, []string{
++			"write", "read", "close", "openat$cgroup",
++		})...)
++
++	case BPF_PROG_TYPE_SK_LOOKUP, BPF_PROG_TYPE_FLOW_DISSECTOR:
++		call := genOpenCall(r, s, "/proc/self/ns/net", 0, 0)
++		attachContext.TargetFd = call.Ret
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, call)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++		bpfAttachCalls = append(bpfAttachCalls, genRandCalls(r, s, bpfProg, []string{
++			"write", "read", "close",
++		})...)
++
++	case BPF_PROG_TYPE_SK_SKB, BPF_PROG_TYPE_SK_MSG:
++		choice := []int{15, 18}
++		mapType := choice[r.Intn(len(choice))]
++		mapCalls := genSingleMapCreateCall(r, s, bpfProg, &bpfMapTypeArray[mapType])
++		if len(mapCalls) == 0 {
++			// fmt.Println("Ldbf: genLdbfProgAttachCall: failed to create map")
++			return bpfAttachCalls
++		}
++		attachContext.TargetFd = mapCalls[len(mapCalls)-1].Ret
++		attachContext.TargetType = MapFd
++		progAttachCalls := Ldbf.genLdbfProgAttachCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, mapCalls...)
++		bpfAttachCalls = append(bpfAttachCalls, progAttachCalls...)
++		bpfAttachCalls = append(bpfAttachCalls, genRandCalls(r, s, bpfProg, []string{
++			"bpf$MAP_LOOKUP_ELEM", "bpf$MAP_UPDATE_ELEM", "bpf$MAP_DELETE_ELEM",
++		})...)
++
++	case BPF_PROG_TYPE_PERF_EVENT, BPF_PROG_TYPE_KPROBE, BPF_PROG_TYPE_TRACEPOINT:
++		call := genHookCall(r, s, bpfProg, "perf_event_open")
++		attachContext.TargetFd = call[len(call)-1].Ret
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, call...)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++
++	case BPF_PROG_TYPE_SOCKET_FILTER, BPF_PROG_TYPE_SK_REUSEPORT:
++		// use setsockopt setsockopt$sock_attach_bpf
++		// fmt.Println("try socket filter")
++		socketCall := genHookCall(r, s, bpfProg, Sockets[r.rand(len(Sockets))])                                        // AF_INET, SOCK_STREAM
++		setSockOpt := genSetSockOptCall(r, s, socketCall[len(socketCall)-1].Ret, 1, 15, bpfProg.BpfProgContext.ProgFD) // SOL_SOCKET, SO_ATTACH_BPF
++		bpfAttachCalls = append(bpfAttachCalls, socketCall...)
++		bpfAttachCalls = append(bpfAttachCalls, setSockOpt)
++
++	case BPF_PROG_TYPE_NETFILTER:
++		// fmt.Println("try netfilter")
++		netdata := NetfilterExtra{
++			Pf:       2, // AF_INET
++			Hooknum:  4, // NF_INET_POST_ROUTING
++			Priority: 0, // NF_IP_PRI_FIRST
++			Flags:    0, // no flags
++		}
++		attachContext.TargetFd = nil
++		attachContext.Extra = netdata
++		attachContext.ExtraType = Netfilter
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++
++	case BPF_PROG_TYPE_TRACING:
++		// need to enable CONFIG_DYNAMIC_FTRACE CONFIG_FUNCTION_TRACER
++		if bpfProg.BpfProgContext.ExpectedAttachType != uint64(BPF_TRACE_FENTRY) &&
++			bpfProg.BpfProgContext.ExpectedAttachType != uint64(BPF_TRACE_FEXIT) &&
++			bpfProg.BpfProgContext.ExpectedAttachType != uint64(BPF_MODIFY_RETURN) {
++			break
++		}
++
++		// fmt.Println("try tracing")
++		attachContext.TargetFd = nil
++		attachContext.Extra = nil
++		//attachContext.ExtraType = Trace
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++
++	case BPF_PROG_TYPE_LSM:
++		// need to enable CONFIG_DYNAMIC_FTRACE CONFIG_FUNCTION_TRACER
++		if bpfProg.BpfProgContext.ExpectedAttachType != uint64(BPF_LSM_MAC) {
++			break
++		}
++		// fmt.Println("try tracing")
++		attachContext.TargetFd = nil
++		attachContext.Extra = nil
++		//attachContext.ExtraType = Trace
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++
++	case BPF_PROG_TYPE_XDP:
++		// fmt.Println("try xdp")
++		// we need to get ifindex of a net device
++		ifIndexCall, ifIndexRet := genIfIndexCall(r, s, "eth1\x00")
++		attachContext.TargetFd = ifIndexRet
++		linkCreateCalls := Ldbf.genLdbfProgLinkCall(r, s, bpfProg, &attachContext)
++		bpfAttachCalls = append(bpfAttachCalls, ifIndexCall...)
++		bpfAttachCalls = append(bpfAttachCalls, linkCreateCalls...)
++		bpfAttachCalls = append(bpfAttachCalls, genRandCalls(r, s, bpfProg, []string{
++			"write", "read", "close",
++		})...)
++
++	}
++
++	return bpfAttachCalls
++
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfProgLinkCall(r *randGen, s *state, bpfProg *BpfProg, attachContext *ProgAttachContext) (calls []*Call) {
++	var currentLinkCreateCall []*Call
++	//progType := bpfProg.BpfProgContext.ProgType
++	linkSyscall := "bpf$LDBF_LINK_CREATE"
++	// if progType == BPF_PROG_TYPE_XDP {
++	// 	linkSyscall = "bpf$BPF_LINK_CREATE_XDP"
++	// }
++	meta := r.target.SyscallMap[linkSyscall]
++	c := MakeCall(meta, nil)
++	c.Args, calls = r.generateArgs(s, meta.Args, DirIn)
++	// prog_fd		PROG_FD
++	// target_fd	TARGET_FD
++	// attach_type	ATTACH_TYPE
++	// flags		FLAGS
++
++	cArgField, _ := c.Args[1].Type().(*PtrType)
++	linkCreateTypes, _ := cArgField.Elem.(*StructType)
++
++	// bpf_link_create_arg
++	ptrArg, ok := c.Args[1].(*PointerArg)
++	if !ok {
++		return currentLinkCreateCall
++	}
++	//bpf_link_create_arg_t
++	linkCreateArgs, ok := ptrArg.Res.(*GroupArg)
++	if !ok || ptrArg.Res == nil {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a PointerArg, got %T\n", c.Args[1])
++		return currentLinkCreateCall
++	}
++
++	for argIdx, field := range linkCreateTypes.Fields {
++		var newArg Arg
++		switch argIdx {
++		case 0: // prog_fd
++			newArg = MakeResultArg(field.Type, DirIn, bpfProg.BpfProgContext.ProgFD, 0)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++		case 1: // target_fd
++			// calls := Ldbf.createAttachedTarget(r, s, bpfProg)
++			// if len(calls) == 0 {
++			// 	fmt.Println("Ldbf: genLdbfProgLinkCall: failed to create attach target")
++			// 	continue
++			// }
++			// currentLinkCreateCall = append(currentLinkCreateCall, calls...)
++			fd := attachContext.TargetFd
++			newArg = MakeResultArg(field.Type, DirIn, fd, 0)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		case 2: // attach_type
++			newArg = MakeConstArg(field.Type, DirIn, bpfProg.BpfProgContext.ExpectedAttachType)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++		case 3: // flags
++			newArg = MakeConstArg(field.Type, DirIn, 0)
++			replaceArg(linkCreateArgs.Inner[argIdx], newArg)
++
++		case 4: // extra
++			if attachContext.Extra == nil {
++				continue
++			}
++			extraTypes := field.Type.(*UnionType)
++			// fmt.Println(extraTypes)
++			// for _, et := range extraTypes.Fields {
++			// 	// fmt.Println("Extra type option:", et)
++			// }
++
++			extraType := extraTypes.Fields[0].Type.(*UnionType).Fields[attachContext.ExtraType].Type
++			extraArg := makeExtraArg(r, s, attachContext.ExtraType, extraType, attachContext.Extra)
++			if extraArg == nil {
++				// fmt.Println("Ldbf: genLdbfProgLinkCall: failed to create extra arg")
++				continue
++			}
++			replaceArg(linkCreateArgs.Inner[argIdx], MakeUnionArg(extraTypes, DirIn, extraArg, 0))
++
++		default:
++
++		}
++	}
++
++	moreCalls, _ := r.patchConditionalFields(c, s)
++	currentLinkCreateCall = append(currentLinkCreateCall, calls...)
++	currentLinkCreateCall = append(currentLinkCreateCall, moreCalls...)
++	currentLinkCreateCall = append(currentLinkCreateCall, c)
++	r.target.assignSizesCall(c)
++
++	return currentLinkCreateCall
++}
++
++func genOpenCall(r *randGen, s *state, file string, flags int, mode int) (call *Call) {
++	meta := r.target.SyscallMap["open"]
++	c := MakeCall(meta, nil)
++	c.Args, _ = r.generateArgs(s, meta.Args, DirIn)
++
++	pathStr := []byte(file)
++	pathArg := meta.Args[0]
++	pathPtr := pathArg.Type.(*PtrType)
++	pathBuffer := pathPtr.Elem.(*BufferType)
++	pathBufferDir := pathPtr.ElemDir
++	pathBufferArg := MakeDataArg(pathBuffer, pathBufferDir, pathStr)
++	c.Args[0] = r.allocAddr(s, pathArg.Type, pathArg.Dir(DirIn), pathBufferArg.Size(), pathBufferArg)
++
++	flagsArg := MakeConstArg(meta.Args[1].Type, DirIn, uint64(flags))
++	c.Args[1] = flagsArg
++
++	modeArg := MakeConstArg(meta.Args[2].Type, DirIn, uint64(mode))
++	c.Args[2] = modeArg
++
++	r.target.assignSizesCall(c)
++	return c
++
++}
++
++func genSocketCall(r *randGen, s *state, domain int, sock_type int, proto int) (call *Call) {
++	meta := r.target.SyscallMap["socket$inet"]
++	c := MakeCall(meta, nil)
++	c.Args, _ = r.generateArgs(s, meta.Args, DirIn)
++
++	domainArg := MakeConstArg(meta.Args[0].Type, DirIn, uint64(domain))
++	c.Args[0] = domainArg
++
++	typeArg := MakeConstArg(meta.Args[1].Type, DirIn, uint64(sock_type))
++	c.Args[1] = typeArg
++
++	protoArg := MakeConstArg(meta.Args[2].Type, DirIn, uint64(proto))
++	c.Args[2] = protoArg
++
++	r.target.assignSizesCall(c)
++	return c
++}
++
++func genSetSockOptCall(r *randGen, s *state, sockfd *ResultArg, level int, optname int, progfd *ResultArg) (call *Call) {
++	meta := r.target.SyscallMap["setsockopt$sock_attach_bpf"]
++	c := MakeCall(meta, nil)
++	c.Args, _ = r.generateArgs(s, meta.Args, DirIn)
++
++	sockfdArg := MakeResultArg(meta.Args[0].Type, DirIn, sockfd, 0)
++	c.Args[0] = sockfdArg
++
++	levelArg := MakeConstArg(meta.Args[1].Type, DirIn, uint64(level))
++	c.Args[1] = levelArg
++
++	optnameArg := MakeConstArg(meta.Args[2].Type, DirIn, uint64(optname))
++	c.Args[2] = optnameArg
++
++	optvalArg := meta.Args[3]
++	optvalPtr := optvalArg.Type.(*PtrType)
++	progfdArg := MakeResultArg(optvalPtr.Elem, DirIn, progfd, 0)
++	c.Args[3] = r.allocAddr(s, optvalArg.Type, optvalArg.Dir(DirIn), progfdArg.Size(), progfdArg)
++
++	r.patchConditionalFields(c, s)
++	r.target.assignSizesCall(c)
++	return c
++}
++
++func genRandCalls(r *randGen, s *state, bpfProg *BpfProg, callName []string) (calls []*Call) {
++	var randCalls []*Call
++	times := r.Intn(3) + 1
++	for i := 0; i < times; i++ {
++		call := callName[r.Intn(len(callName))]
++		calls := genHookCall(r, s, bpfProg, call)
++		randCalls = append(randCalls, calls...)
++	}
++	return randCalls
++}
++
++func genHookCall(r *randGen, s *state, bpfProg *BpfProg, callName string) (calls []*Call) {
++	var hookCalls []*Call
++	meta := r.target.SyscallMap[callName]
++	c := MakeCall(meta, nil)
++	c.Args, calls = r.generateArgs(s, meta.Args, DirIn)
++	moreCalls, _ := r.patchConditionalFields(c, s)
++	hookCalls = append(hookCalls, calls...)
++	hookCalls = append(hookCalls, moreCalls...)
++	r.target.assignSizesCall(c)
++	hookCalls = append(hookCalls, c)
++	return hookCalls
++}
++
++func genIfIndexCall(r *randGen, s *state, ifName string) (calls []*Call, ret *ResultArg) {
++	var hookCalls []*Call
++	meta := r.target.SyscallMap["ioctl$sock_SIOCGIFINDEX"]
++	c := MakeCall(meta, nil)
++	c.Args, calls = r.generateArgs(s, meta.Args, DirIn)
++
++	socketCall := genSocketCall(r, s, 2, 1, 0) // AF_INET, SOCK_STREAM
++	hookCalls = append(hookCalls, socketCall)
++
++	sockfdArg := MakeResultArg(meta.Args[0].Type, DirIn, socketCall.Ret, 0)
++	c.Args[0] = sockfdArg
++
++	const IFNAMSIZ = 16
++	nameBuffer := make([]byte, IFNAMSIZ)
++	copy(nameBuffer, []byte(ifName))
++
++	ifreqptrArg, ok := c.Args[2].(*PointerArg)
++	if !ok {
++		return hookCalls, nil
++	}
++
++	ifreqArg, ok := ifreqptrArg.Res.(*GroupArg)
++	if !ok {
++		return hookCalls, nil
++	}
++	//fmt.Printf("ifreq Arg inner %v %v %v\n", ifreqArg.Inner, ifreqArg.Inner[0], ifreqArg.Inner[1])
++	ifindexArg := ifreqArg.Inner[1]
++	// replaceArg(ifreqArg.Inner[0], MakeDataArg(ifreqArg.Inner[0].Type(), DirIn, nameBuffer))
++	ret = MakeResultArg(ifindexArg.Type(), DirOut, ifindexArg.(*ResultArg), 0)
++
++	moreCalls, _ := r.patchConditionalFields(c, s)
++	hookCalls = append(hookCalls, calls...)
++	hookCalls = append(hookCalls, moreCalls...)
++	r.target.assignSizesCall(c)
++	hookCalls = append(hookCalls, c)
++	return hookCalls, ifindexArg.(*ResultArg)
++
++}
+diff --git a/prog/ldbf_btf.go b/prog/ldbf_btf.go
+new file mode 100644
+index 000000000..be67db332
+--- /dev/null
++++ b/prog/ldbf_btf.go
+@@ -0,0 +1,528 @@
++package prog
++
++import (
++	"fmt"
++	"math/rand"
++	"os"
++	"os/exec"
++	"regexp"
++)
++
++var LdbfBtfIdMap = make(map[string]int)
++
++func getBtfidFromVmlinux(vmlinuxPath string, funcName string) int {
++	var btfidRegex = regexp.MustCompile(`\[(.*?)\]`)
++	cmd := fmt.Sprintf("bpftool btf dump file %s | grep %s", vmlinuxPath, funcName)
++	execResult := exec.Command("bash", "-c", cmd)
++	output, err := execResult.CombinedOutput()
++	if err != nil {
++		// fmt.Printf("Error executing command: %v\n", err)
++		return -1
++	}
++	// fmt.Printf("Command output: %s\n", output)
++	matches := btfidRegex.FindStringSubmatch(string(output))
++	//fmt.Println(matches)
++	if len(matches) < 2 {
++		// fmt.Printf("No match found in output: %s\n", output)
++		return -1
++	}
++	// fmt.Printf("Matched string: %s\n", matches[1])
++	var btfid int
++	_, err = fmt.Sscanf(matches[1], "%d", &btfid)
++	if err != nil {
++		// fmt.Printf("Error parsing btfid: %v\n", err)
++		return -1
++	}
++	return btfid
++
++}
++
++func initBtfMap() {
++	vmlinuxPath := os.Getenv("LDBF_VMLINUX_PATH")
++	if vmlinuxPath == "" {
++		fmt.Println("Warning: LDBF_VMLINUX_PATH is not set. Skipping BTF ID initialization.")
++		panic("LDBF_VMLINUX_PATH is required for BTF ID initialization.")
++	}
++	for _, btfFunc := range BtfAttachFuncs {
++		id := getBtfidFromVmlinux(vmlinuxPath, btfFunc)
++		LdbfBtfIdMap[btfFunc] = id
++	}
++
++}
++
++func getRandomBtfid() int {
++	btfid := 0
++	length := len(BtfAttachFuncs)
++	circles := 0
++	for btfid <= 0 {
++		randomIndex := rand.Intn(length)
++		btfFunc := BtfAttachFuncs[randomIndex]
++		btfid = LdbfBtfIdMap[btfFunc]
++		circles += 1
++		if circles >= 3 {
++			return 0
++		}
++	}
++	// fmt.Printf("getRandomBtfid: selected BTF ID %d\n", btfid)
++	return btfid
++}
++
++type BtfMessage struct {
++	key_size     int
++	value_size   int
++	key_id       int
++	value_id     int
++	typeIdx      []uint64
++	typesSlice   [][]uint64
++	stringsSlice []uint64
++}
++
++const (
++	IntIdx    = 0
++	PtrIdx    = 1
++	ArrayIdx  = 2
++	StructIdx = 3
++	UnionIdx  = 4
++	EnumIdx   = 5
++	FuncIdx   = 11
++	FloatIdx  = 15
++)
++
++var btfTypeList = []uint64{IntIdx, PtrIdx, ArrayIdx, StructIdx, UnionIdx, EnumIdx, FuncIdx, FloatIdx}
++
++func genBtfTypeInt(name_off uint64) []uint64 {
++	// btf_type_int {
++	// # Note: this is an offset in bpf_btf_program:strings
++	// 	name_off	btf_opt_name_off
++	// 	info_vlen	const[0, int16]
++	// 	info_pad	const[0, int8]
++	// 	info_typ	const[BTF_KIND_INT, int8]
++	// 	size		const[0, int32]
++	// 	bits		int8[0:128]
++	// 	pad		const[0, int8]
++	// 	offset		int8[0:128]
++	// 	encoding	flags[btf_type_int_encoding, int8]
++	// }
++	return []uint64{name_off, 0, 0, 1, 4, 32, 0, 0, 1}
++}
++
++func genBtfTypeFloat(name_off uint64) []uint64 {
++
++	return []uint64{name_off, 0, 0, 16, 8}
++}
++
++func genBTFMessage() BtfMessage {
++	var typesSlice [][]uint64
++	var btfMsg BtfMessage
++	btfMsg.key_size = 4
++	btfMsg.value_size = 4
++	btfMsg.key_id = 1
++	btfMsg.value_id = 1
++	typesSlice = append(typesSlice, []uint64{0, 0, 0, 1, 4, 32, 0, 0, 1}) // int a
++	typesSlice = append(typesSlice, []uint64{1, 0, 0, 16, 8})             // float b
++	//typesSlice = append(typesSlice, []uint64{3, 0, 0, 12, 2})
++	btfMsg.typesSlice = typesSlice
++	btfMsg.stringsSlice = []uint64{0, 'a', 0, 'b'}
++	btfMsg.typeIdx = []uint64{IntIdx, FloatIdx}
++
++	return btfMsg
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfBtfLoadCall(r *randGen, s *state, bpfProg *BpfProg) []*Call {
++	// var btfHeaderStrlenIdx   int
++	// var btfHeaderStroffIdx   int
++	//var btfHeaderTypelenIdx  int
++	var btfHeaderTypesIdx int
++	var btfTypesArray []Arg
++	var btfStringsHold []Arg
++	var currentBtfLoadCall []*Call
++
++	meta := r.target.SyscallMap["bpf$LDBF_BPF_BTF_LOAD"]
++	c := MakeCall(meta, nil)
++
++	c.Args, _ = r.generateArgs(s, meta.Args, DirIn)
++
++	// bpf_btf_load_arg ptr
++	cArgField, _ := c.Args[1].Type().(*PtrType)
++	bpfBtfLoadArg, _ := cArgField.Elem.(*StructType)
++
++	cArgArg, ok := c.Args[1].(*PointerArg)
++	if !ok {
++		return currentBtfLoadCall
++	}
++
++	btfLoadArgs, ok := cArgArg.Res.(*GroupArg) // bpf_btf_load
++	if !ok {
++		return currentBtfLoadCall
++	}
++
++	btfProgPtr, ok := btfLoadArgs.Inner[0].(*PointerArg) // bpf_btf_load->btf
++	if !ok {
++		return currentBtfLoadCall
++	}
++
++	btfProgArgs, ok := btfProgPtr.Res.(*GroupArg) // bpf_btf_program
++	if !ok {
++		return currentBtfLoadCall
++	}
++
++	btfHeaderArgs, _ := btfProgArgs.Inner[0].(*GroupArg)  // btf_header
++	btfStringsArgs, _ := btfProgArgs.Inner[1].(*GroupArg) // btf_strings
++	// fmt.Println(btfStringsArgs)
++
++	//btfHeaderTypelenIdx = 3
++	// btfHeaderStroffIdx  = 6
++	// btfHeaderStrlenIdx  = 7
++	btfHeaderTypesIdx = 8
++	btfTypesArray = nil
++	btfStringsHold = nil
++
++	//fmt.Println(xxx.Inner[3])
++	//bpfBtfLoadArgDir := cArgField.ElemDir
++
++	// ptrArg, ok := c.Args[1].(*PointerArg)
++	// if !ok || ptrArg.Res == nil {
++	// 	fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a PointerArg, got %T\n", c.Args[1])
++	// 	//continue
++	// }
++
++	// // bpf_map_create_arg union arg
++	// unionArg, ok := ptrArg.Res.(*UnionArg)
++	// if !ok || unionArg.Option == nil {
++	// 	fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1].Res is not a UnionArg, got %T\n", ptrArg.Res)
++	// 	//continue
++	// }
++	// originalStructArg, ok := unionArg.Option.(*GroupArg)
++	// if !ok {
++	// 	fmt.Printf("Ldbf: genLdbfMapCreateCall: unionArg.Option is not a GroupArg, got %T\n", unionArg.Option)
++	// 	//continue
++	// }
++
++	for bpfBtfLoadIdx, bpfBtfLoadField := range bpfBtfLoadArg.Fields {
++		//var newArg Arg
++		switch bpfBtfLoadIdx {
++		case 0:
++			// btf
++			btfFieldPtr, _ := bpfBtfLoadField.Type.(*PtrType)
++			btfProgDir := btfFieldPtr.ElemDir
++
++			//btfHeaderTypelenType := btfHeaderArgs.Inner[btfHeaderTypelenIdx].Type().(*ConstType)
++			// btfHeaderStroffType  := btfHeaderArgs.Inner[btfHeaderStroffIdx].Type().(*LenType)
++			// btfHeaderStrlenType  := btfHeaderArgs.Inner[btfHeaderStrlenIdx].Type().(*LenType)
++			btfHeaderTypesType := btfHeaderArgs.Inner[btfHeaderTypesIdx].Type().(*ArrayType)
++
++			btfMsg := genBTFMessage()
++			for index, typeIdx := range btfMsg.typeIdx {
++				testslice := btfMsg.typesSlice[index]
++				btfType := btfHeaderTypesType.Elem.(*UnionType)
++
++				btfTypeFuncType := btfType.Fields[typeIdx].Type
++				// fmt.Println(btfTypeFuncType)
++				btfTypeFunc := btfTypeFuncType.(*StructType)
++				btfTypeFuncArgs := make([]Arg, len(btfTypeFunc.Fields))
++				// fmt.Printf("genLdbfBtfLoadCall: Generating BTF type index %d with type ID %d\n", index, typeIdx)
++				for idx, field := range btfTypeFunc.Fields {
++					//fmt.Printf("btfTypeFunc field %d: %v\n", idx, field)
++					btfTypeFuncArgs[idx] = MakeConstArg(field.Type, btfProgDir, testslice[idx])
++				}
++				btfTypeFuncGroup := MakeGroupArg(btfTypeFunc, DirIn, btfTypeFuncArgs)
++				btfTypeFuncArrayArg := MakeUnionArg(btfType, DirIn, btfTypeFuncGroup, int(typeIdx))
++				btfTypesArray = append(btfTypesArray, btfTypeFuncArrayArg)
++			}
++
++			btfTypesArrayArg := MakeGroupArg(btfHeaderTypesType, DirIn, btfTypesArray)
++
++			testStrings := btfMsg.stringsSlice
++			btfStringsType := btfStringsArgs.Inner[1].Type().(*ArrayType)
++			btfStringsElemType := btfStringsType.Elem.(*FlagsType)
++			//btfStringsElemFields := btfStringsElemType.Fields
++			for _, char := range testStrings {
++				btfStringsHold = append(btfStringsHold, MakeConstArg(btfStringsElemType, DirIn, char))
++			}
++			btfStringsGroup := MakeGroupArg(btfStringsType, DirIn, btfStringsHold)
++
++			//testarg1 :=MakeConstArg(btfHeaderTypelenType, btfProgDir, 40)
++			// testarg2 :=MakeConstArg(btfHeaderStroffType, btfProgDir, 50)
++			// testarg3 :=MakeConstArg(btfHeaderStrlenType, btfProgDir, 60)
++			//testarg4 :=MakeConstArg(btfHeaderTypesType, btfProgDir, 70)
++
++			//replaceArg(btfHeaderArgs.Inner[btfHeaderTypelenIdx], testarg1)
++			// replaceArg(btfHeaderArgs.Inner[btfHeaderStroffIdx], testarg2)
++			// replaceArg(btfHeaderArgs.Inner[btfHeaderStrlenIdx], testarg3)
++			replaceArg(btfHeaderArgs.Inner[btfHeaderTypesIdx], btfTypesArrayArg)
++			replaceArg(btfStringsArgs.Inner[1], btfStringsGroup)
++
++		case 1:
++			//arr := make([]Arg, 200)
++			bufArg := MakeOutDataArg(bpfBtfLoadField.Type.(*PtrType).Elem, DirOut, 200)
++			ptrArg := MakePointerArg(bpfBtfLoadField.Type, DirOut, s.ma.alloc(r, 200, bufArg.Type().Alignment()), bufArg)
++			replaceArg(btfLoadArgs.Inner[bpfBtfLoadIdx], ptrArg)
++
++			// btf_log_buf
++		case 2:
++			// btf_size
++		case 3:
++			// btf_log_size
++		case 4:
++			// btf_log_level
++			arg := MakeConstArg(bpfBtfLoadField.Type.(*IntType), DirIn, 1)
++			replaceArg(btfLoadArgs.Inner[bpfBtfLoadIdx], arg)
++		case 5:
++			// btf_log_true_size
++			arg := MakeConstArg(bpfBtfLoadField.Type.(*IntType), DirIn, 0)
++			replaceArg(btfLoadArgs.Inner[bpfBtfLoadIdx], arg)
++		case 6:
++			// btf_flags
++			arg := MakeConstArg(bpfBtfLoadField.Type.(*FlagsType), DirIn, 0)
++			replaceArg(btfLoadArgs.Inner[bpfBtfLoadIdx], arg)
++		case 7:
++			// btf_token_fd
++			// arg := MakeConstArg(bpfBtfLoadField.Type.(*UnionType), DirIn, 0)
++			// replaceArg(btfLoadArgs.Inner[bpfBtfLoadIdx], arg)
++		default:
++
++		}
++
++	}
++
++	// store the return value
++	r.target.assignSizesCall(c)
++	bpfProg.BtfRes = c.Ret
++
++	currentBtfLoadCall = append(currentBtfLoadCall, c)
++	return currentBtfLoadCall
++}
++
++var BtfAttachFuncs = []string{
++	"bpf_lsm_perf_event_write",
++	"bpf_lsm_perf_event_read",
++	"bpf_lsm_perf_event_free",
++	"bpf_lsm_perf_event_alloc",
++	"bpf_lsm_perf_event_open",
++	"bpf_lsm_locked_down",
++	"bpf_lsm_bpf_prog_free_security",
++	"bpf_lsm_bpf_prog_alloc_security",
++	"bpf_lsm_bpf_map_free_security",
++	"bpf_lsm_bpf_map_alloc_security",
++	"bpf_lsm_bpf_prog",
++	"bpf_lsm_bpf_map",
++	"bpf_lsm_bpf",
++	"bpf_lsm_audit_rule_free",
++	"bpf_lsm_audit_rule_match",
++	"bpf_lsm_audit_rule_known",
++	"bpf_lsm_audit_rule_init",
++	"bpf_lsm_key_getsecurity",
++	"bpf_lsm_key_permission",
++	"bpf_lsm_key_free",
++	"bpf_lsm_key_alloc",
++	"bpf_lsm_xfrm_decode_session",
++	"bpf_lsm_xfrm_state_pol_flow_match",
++	"bpf_lsm_xfrm_policy_lookup",
++	"bpf_lsm_xfrm_state_delete_security",
++	"bpf_lsm_xfrm_state_free_security",
++	"bpf_lsm_xfrm_state_alloc_acquire",
++	"bpf_lsm_xfrm_state_alloc",
++	"bpf_lsm_xfrm_policy_delete_security",
++	"bpf_lsm_xfrm_policy_free_security",
++	"bpf_lsm_xfrm_policy_clone_security",
++	"bpf_lsm_xfrm_policy_alloc_security",
++	"bpf_lsm_ib_free_security",
++	"bpf_lsm_ib_alloc_security",
++	"bpf_lsm_ib_endport_manage_subnet",
++	"bpf_lsm_ib_pkey_access",
++	"bpf_lsm_sctp_sk_clone",
++	"bpf_lsm_sctp_bind_connect",
++	"bpf_lsm_sctp_assoc_request",
++	"bpf_lsm_tun_dev_open",
++	"bpf_lsm_tun_dev_attach",
++	"bpf_lsm_tun_dev_attach_queue",
++	"bpf_lsm_tun_dev_create",
++	"bpf_lsm_tun_dev_free_security",
++	"bpf_lsm_tun_dev_alloc_security",
++	"bpf_lsm_req_classify_flow",
++	"bpf_lsm_secmark_refcount_dec",
++	"bpf_lsm_secmark_refcount_inc",
++	"bpf_lsm_secmark_relabel_packet",
++	"bpf_lsm_inet_conn_established",
++	"bpf_lsm_inet_csk_clone",
++	"bpf_lsm_inet_conn_request",
++	"bpf_lsm_sock_graft",
++	"bpf_lsm_sk_getsecid",
++	"bpf_lsm_sk_clone_security",
++	"bpf_lsm_sk_free_security",
++	"bpf_lsm_sk_alloc_security",
++	"bpf_lsm_socket_getpeersec_dgram",
++	"bpf_lsm_socket_getpeersec_stream",
++	"bpf_lsm_socket_sock_rcv_skb",
++	"bpf_lsm_socket_shutdown",
++	"bpf_lsm_socket_setsockopt",
++	"bpf_lsm_socket_getsockopt",
++	"bpf_lsm_socket_getpeername",
++	"bpf_lsm_socket_getsockname",
++	"bpf_lsm_socket_recvmsg",
++	"bpf_lsm_socket_sendmsg",
++	"bpf_lsm_socket_accept",
++	"bpf_lsm_socket_listen",
++	"bpf_lsm_socket_connect",
++	"bpf_lsm_socket_bind",
++	"bpf_lsm_socket_socketpair",
++	"bpf_lsm_socket_post_create",
++	"bpf_lsm_socket_create",
++	"bpf_lsm_unix_may_send",
++	"bpf_lsm_unix_stream_connect",
++	"bpf_lsm_post_notification",
++	"bpf_lsm_inode_getsecctx",
++	"bpf_lsm_inode_setsecctx",
++	"bpf_lsm_inode_notifysecctx",
++	"bpf_lsm_inode_invalidate_secctx",
++	"bpf_lsm_release_secctx",
++	"bpf_lsm_secctx_to_secid",
++	"bpf_lsm_secid_to_secctx",
++	"bpf_lsm_ismaclabel",
++	"bpf_lsm_setprocattr",
++	"bpf_lsm_getprocattr",
++	"bpf_lsm_d_instantiate",
++	"bpf_lsm_netlink_send",
++	"bpf_lsm_sem_semop",
++	"bpf_lsm_sem_semctl",
++	"bpf_lsm_sem_associate",
++	"bpf_lsm_sem_free_security",
++	"bpf_lsm_sem_alloc_security",
++	"bpf_lsm_shm_shmat",
++	"bpf_lsm_shm_shmctl",
++	"bpf_lsm_shm_associate",
++	"bpf_lsm_shm_free_security",
++	"bpf_lsm_shm_alloc_security",
++	"bpf_lsm_msg_queue_msgrcv",
++	"bpf_lsm_msg_queue_msgsnd",
++	"bpf_lsm_msg_queue_msgctl",
++	"bpf_lsm_msg_queue_associate",
++	"bpf_lsm_msg_queue_free_security",
++	"bpf_lsm_msg_queue_alloc_security",
++	"bpf_lsm_msg_msg_free_security",
++	"bpf_lsm_msg_msg_alloc_security",
++	"bpf_lsm_ipc_getsecid",
++	"bpf_lsm_ipc_permission",
++	"bpf_lsm_task_to_inode",
++	"bpf_lsm_task_prctl",
++	"bpf_lsm_task_kill",
++	"bpf_lsm_task_movememory",
++	"bpf_lsm_task_getscheduler",
++	"bpf_lsm_task_setscheduler",
++	"bpf_lsm_task_setrlimit",
++	"bpf_lsm_task_prlimit",
++	"bpf_lsm_task_getioprio",
++	"bpf_lsm_task_setioprio",
++	"bpf_lsm_task_setnice",
++	"bpf_lsm_task_getsecid",
++	"bpf_lsm_task_getsid",
++	"bpf_lsm_task_getpgid",
++	"bpf_lsm_task_setpgid",
++	"bpf_lsm_task_fix_setgid",
++	"bpf_lsm_task_fix_setuid",
++	"bpf_lsm_kernel_post_read_file",
++	"bpf_lsm_kernel_read_file",
++	"bpf_lsm_kernel_load_data",
++	"bpf_lsm_kernel_module_request",
++	"bpf_lsm_kernel_create_files_as",
++	"bpf_lsm_kernel_act_as",
++	"bpf_lsm_cred_getsecid",
++	"bpf_lsm_cred_transfer",
++	"bpf_lsm_cred_prepare",
++	"bpf_lsm_cred_free",
++	"bpf_lsm_cred_alloc_blank",
++	"bpf_lsm_task_free",
++	"bpf_lsm_task_alloc",
++	"bpf_lsm_file_open",
++	"bpf_lsm_file_receive",
++	"bpf_lsm_file_send_sigiotask",
++	"bpf_lsm_file_set_fowner",
++	"bpf_lsm_file_fcntl",
++	"bpf_lsm_file_lock",
++	"bpf_lsm_file_mprotect",
++	"bpf_lsm_mmap_file",
++	"bpf_lsm_mmap_addr",
++	"bpf_lsm_file_ioctl",
++	"bpf_lsm_file_free_security",
++	"bpf_lsm_file_alloc_security",
++	"bpf_lsm_file_permission",
++	"bpf_lsm_kernfs_init_security",
++	"bpf_lsm_inode_copy_up_xattr",
++	"bpf_lsm_inode_copy_up",
++	"bpf_lsm_inode_getsecid",
++	"bpf_lsm_inode_listsecurity",
++	"bpf_lsm_inode_setsecurity",
++	"bpf_lsm_inode_getsecurity",
++	"bpf_lsm_inode_killpriv",
++	"bpf_lsm_inode_need_killpriv",
++	"bpf_lsm_inode_removexattr",
++	"bpf_lsm_inode_listxattr",
++	"bpf_lsm_inode_getxattr",
++	"bpf_lsm_inode_post_setxattr",
++	"bpf_lsm_inode_setxattr",
++	"bpf_lsm_inode_getattr",
++	"bpf_lsm_inode_setattr",
++	"bpf_lsm_inode_permission",
++	"bpf_lsm_inode_follow_link",
++	"bpf_lsm_inode_readlink",
++	"bpf_lsm_inode_rename",
++	"bpf_lsm_inode_mknod",
++	"bpf_lsm_inode_rmdir",
++	"bpf_lsm_inode_mkdir",
++	"bpf_lsm_inode_symlink",
++	"bpf_lsm_inode_unlink",
++	"bpf_lsm_inode_link",
++	"bpf_lsm_inode_create",
++	"bpf_lsm_inode_init_security",
++	"bpf_lsm_inode_free_security",
++	"bpf_lsm_inode_alloc_security",
++	"bpf_lsm_path_notify",
++	"bpf_lsm_path_chroot",
++	"bpf_lsm_path_chown",
++	"bpf_lsm_path_chmod",
++	"bpf_lsm_path_rename",
++	"bpf_lsm_path_link",
++	"bpf_lsm_path_symlink",
++	"bpf_lsm_path_truncate",
++	"bpf_lsm_path_mknod",
++	"bpf_lsm_path_rmdir",
++	"bpf_lsm_path_mkdir",
++	"bpf_lsm_path_unlink",
++	"bpf_lsm_dentry_create_files_as",
++	"bpf_lsm_dentry_init_security",
++	"bpf_lsm_move_mount",
++	"bpf_lsm_sb_clone_mnt_opts",
++	"bpf_lsm_sb_set_mnt_opts",
++	"bpf_lsm_sb_pivotroot",
++	"bpf_lsm_sb_umount",
++	"bpf_lsm_sb_mount",
++	"bpf_lsm_sb_statfs",
++	"bpf_lsm_sb_show_options",
++	"bpf_lsm_sb_kern_mount",
++	"bpf_lsm_sb_remount",
++	"bpf_lsm_sb_eat_lsm_opts",
++	"bpf_lsm_sb_free_mnt_opts",
++	"bpf_lsm_sb_free_security",
++	"bpf_lsm_sb_alloc_security",
++	"bpf_lsm_fs_context_parse_param",
++	"bpf_lsm_fs_context_dup",
++	"bpf_lsm_bprm_committed_creds",
++	"bpf_lsm_bprm_committing_creds",
++	"bpf_lsm_bprm_check_security",
++	"bpf_lsm_bprm_creds_from_file",
++	"bpf_lsm_bprm_creds_for_exec",
++	"bpf_lsm_vm_enough_memory",
++	"bpf_lsm_settime",
++	"bpf_lsm_syslog",
++	"bpf_lsm_quota_on",
++	"bpf_lsm_quotactl",
++	"bpf_lsm_capable",
++	"bpf_lsm_capset",
++	"bpf_lsm_capget",
++	"bpf_lsm_ptrace_traceme",
++	"bpf_lsm_ptrace_access_check",
++	"bpf_lsm_binder_transfer_file",
++	"bpf_lsm_binder_transfer_binder",
++	"bpf_lsm_binder_transaction",
++	"bpf_lsm_binder_set_context_mgr",
++}
+diff --git a/prog/ldbf_insn.go b/prog/ldbf_insn.go
+new file mode 100644
+index 000000000..49ee5257b
+--- /dev/null
++++ b/prog/ldbf_insn.go
+@@ -0,0 +1,278 @@
++package prog
++
++import (
++	"encoding/binary"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// bpfAttrInfo holds the metadata needed to find the BPF instructions.
++type bpfAttrInfo struct {
++	baseAddr  uint64 // The base address of the bpf_attr struct
++	insnsAddr uint64 // The address where the instructions are stored
++	insnsCnt  uint32 // The number of instructions
++}
++
++// ... (memWrite, storeBitmask, memSet structs remain the same) ...
++type memWrite struct {
++	addr  uint64
++	value uint64
++	size  int
++}
++type storeBitmask struct {
++	addr  uint64
++	value uint64
++	off   uint64
++	len   uint64
++}
++type memSet struct {
++	addr  uint64
++	value uint64
++	size  uint64
++}
++
++var (
++	// MODIFIED: Made the "_t" optional in the type to match both "uint32" and "uint32_t"
++	directWriteRegex = regexp.MustCompile(`\*\((uint(8|16|32|64))(_t)?\*?\)(0x[0-9a-f]+)\s*=\s*(-?0x[0-9a-f]+|-?[0-9]+)`)
++
++	// MODIFIED: Made the "_t" optional in storeBitmaskRegex as well for consistency
++	storeBitmaskRegex = regexp.MustCompile(`STORE_BY_BITMASK\(\s*uint8(_t)?\s*,\s*,\s*(0x[0-9a-f]+)\s*,\s*(0x[0-9a-f]+|[0-9]+)\s*,\s*([0-9]+)\s*,\s*([0-9]+)\s*\)`)
++
++	memsetRegex = regexp.MustCompile(`memset\(\s*\(void\*\)(0x[0-9a-f]+)\s*,\s*(0x[0-9a-f]+|[0-9]+)\s*,\s*([0-9]+)\s*\)`)
++)
++
++// ... (parseUint, parseInt functions remain the same) ...
++func parseUint(s string) (uint64, error) {
++	return strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
++}
++func parseInt(s string) (int64, error) {
++	if strings.HasPrefix(s, "-") {
++		val, err := strconv.ParseUint(strings.TrimPrefix(s, "-0x"), 16, 64)
++		if err != nil {
++			return 0, err
++		}
++		return -int64(val), nil
++	}
++	return strconv.ParseInt(strings.TrimPrefix(s, "0x"), 16, 64)
++}
++
++func extractBPFInstructions(cCode string) ([]byte, error) {
++	memory := make(map[uint64]byte)
++	var attrInfo bpfAttrInfo
++
++	lines := strings.Split(cCode, "\n")
++
++	// --- Step 1: Dynamically find the base address from the first valid line ---
++	var firstLine string
++	for _, line := range lines {
++		trimmed := strings.TrimSpace(line)
++		if trimmed != "" {
++			firstLine = trimmed
++			break
++		}
++	}
++	if firstLine == "" {
++		return nil, fmt.Errorf("input code is empty")
++	}
++
++	// Clean up and parse the first line to get the base address
++	cleanFirstLine := strings.TrimSuffix(strings.TrimPrefix(firstLine, "NONFAILING("), ")")
++	// MODIFIED: Also trim the semicolon to ensure a clean match
++	cleanFirstLine = strings.TrimSpace(strings.TrimSuffix(cleanFirstLine, ";"))
++
++	if matches := directWriteRegex.FindStringSubmatch(cleanFirstLine); len(matches) > 0 {
++		// Note: Regex group indices shift because of the new optional group (_t)?
++		// The address is now in group 4.
++		baseAddr, err := parseUint(matches[4])
++		if err != nil {
++			return nil, fmt.Errorf("could not parse base address from first line: %v", err)
++		}
++		attrInfo.baseAddr = baseAddr
++	} else {
++		return nil, fmt.Errorf("first line '%s' does not match expected format for base address extraction", cleanFirstLine)
++	}
++
++	// --- Pass 2: Find insns address and count using the dynamic base address ---
++	for _, line := range lines {
++		cleanLine := strings.TrimSpace(line)
++		if strings.HasPrefix(cleanLine, "NONFAILING(") {
++			cleanLine = strings.TrimSuffix(strings.TrimPrefix(cleanLine, "NONFAILING("), ")")
++		}
++
++		if matches := directWriteRegex.FindStringSubmatch(cleanLine); len(matches) > 0 {
++			// Address is in group 4, value is in group 5
++			addr, _ := parseUint(matches[4])
++			val, _ := parseInt(matches[5])
++
++			if addr == attrInfo.baseAddr+4 {
++				attrInfo.insnsCnt = uint32(val)
++			}
++			if addr == attrInfo.baseAddr+8 {
++				attrInfo.insnsAddr = uint64(val)
++			}
++		}
++	}
++
++	if attrInfo.insnsAddr == 0 || attrInfo.insnsCnt == 0 {
++		return nil, fmt.Errorf("could not find BPF insns address or count using base address 0x%x", attrInfo.baseAddr)
++	}
++
++	// --- Pass 3: Populate the memory map ---
++	for _, line := range lines {
++		cleanLine := strings.TrimSpace(line)
++		if strings.HasPrefix(cleanLine, "NONFAILING(") {
++			cleanLine = strings.TrimSuffix(strings.TrimPrefix(cleanLine, "NONFAILING("), ")")
++		}
++		cleanLine = strings.Trim(cleanLine, ";")
++
++		if matches := directWriteRegex.FindStringSubmatch(cleanLine); len(matches) > 0 {
++			// Type is in group 1, address in 4, value in 5
++			typeName := matches[1]
++			addr, _ := parseUint(matches[4])
++			val, _ := parseInt(matches[5])
++			val64 := uint64(val)
++			byteSize := 0
++			switch typeName {
++			case "uint8":
++				byteSize = 1
++			case "uint16":
++				byteSize = 2
++			case "uint32":
++				byteSize = 4
++			case "uint64":
++				byteSize = 8
++			}
++			buf := make([]byte, byteSize)
++			switch byteSize {
++			case 1:
++				buf[0] = byte(val64)
++			case 2:
++				binary.LittleEndian.PutUint16(buf, uint16(val64))
++			case 4:
++				binary.LittleEndian.PutUint32(buf, uint32(val64))
++			case 8:
++				binary.LittleEndian.PutUint64(buf, val64)
++			}
++			for i := 0; i < byteSize; i++ {
++				memory[addr+uint64(i)] = buf[i]
++			}
++		} else if matches := storeBitmaskRegex.FindStringSubmatch(cleanLine); len(matches) > 0 {
++			// Group indices shift here as well
++			addr, _ := parseUint(matches[2])
++			val, _ := parseUint(matches[3])
++			off, _ := parseUint(matches[4])
++			blen, _ := parseUint(matches[5])
++			mask := ((uint64(1) << blen) - 1) << off
++			oldVal := uint64(memory[addr])
++			newVal := (oldVal & ^mask) | ((val << off) & mask)
++			memory[addr] = byte(newVal)
++		} else if matches := memsetRegex.FindStringSubmatch(cleanLine); len(matches) > 0 {
++			addr, _ := parseUint(matches[1])
++			val, _ := parseUint(matches[2])
++			size, _ := parseUint(matches[3])
++			for i := uint64(0); i < size; i++ {
++				memory[addr+i] = byte(val)
++			}
++		}
++	}
++
++	// --- Step 4: Extract the bytecode ---
++	totalBytes := uint64(attrInfo.insnsCnt * 8)
++	bytecode := make([]byte, totalBytes)
++	for i := uint64(0); i < totalBytes; i++ {
++		addr := attrInfo.insnsAddr + i
++		bytecode[i] = memory[addr]
++	}
++
++	return bytecode, nil
++}
++
++// generateOutputPath generates an output file path based on an input file path.
++// 1. Creates a "corpus" subdirectory in the same directory as the input file.
++// 2. Appends a timestamp to the original filename to create the new filename.
++func generateOutputPath(inputFile string, isBpfRaw bool) (string, error) {
++	// Step 1: Parse the input path to get the directory, full filename, base name, and extension.
++	var base string
++	var ext string
++	var err error
++	var baseName string
++
++	if isBpfRaw {
++		baseName = "bpf"
++		ext = ".txt"
++	} else {
++		base = filepath.Base(inputFile)
++		ext = filepath.Ext(base)
++		// strings.TrimSuffix removes the extension from the filename to get the base name.
++		baseName = strings.TrimSuffix(base, ext)
++	}
++
++	// Step 2: Construct the output directory path.
++	// filepath.Join safely handles path separators (/ or \).
++	outputDir, err := JoinLdbfLoraDir("corpus")
++	if err != nil {
++		return "", fmt.Errorf("failed to get output directory: %w", err)
++	}
++
++	// Step 3: Generate a timestamp string with millisecond precision.
++	timestamp := time.Now().Format("060102150405.000")
++
++	// Step 4: Construct the new filename with the timestamp.
++	// Sprintf is used to format the string, joining the different parts.
++	var outputFilename string
++	outputFilename = fmt.Sprintf("%s-%s%s", baseName, timestamp, ext)
++
++	// Step 5: Join the output directory and output filename to create the final full path.
++	outputFile := filepath.Join(outputDir, outputFilename)
++
++	return outputFile, nil
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) ExtBpfProgLoadCallInsn(call int, p *Prog, bpfProgArgC string, isBpfRaw bool) {
++	bytecode, err := extractBPFInstructions(bpfProgArgC)
++	if err != nil {
++		// fmt.Printf("ExtBpfProgLoadCallInsn: Error extracting BPF instructions: %v\n", err)
++		return
++	}
++
++	// 1. Create a strings.Builder for efficient string construction.
++	var bytes_buffer strings.Builder
++
++	// 2. Loop through the bytecode, writing the formatted content to the strings.Builder instead of printing directly.
++	for i := 0; i < len(bytecode); i++ {
++		// Use fmt.Fprintf to write the formatted string to the builder.
++		// _, err := fmt.Fprintf(&bytes_buffer, "0x%02x", bytecode[i])
++		if err != nil {
++			// fmt.Printf("ExtBpfProgLoadCallInsn: Error writing to string builder: %v\n", err)
++		}
++
++		// If it's not the last byte, add a comma and a space.
++		if i+1 < len(bytecode) {
++			bytes_buffer.WriteString(", ")
++		}
++	}
++	bpfProg := Ldbf.GetLdbfBpfProg()
++	if bpfProg == nil {
++		// fmt.Printf("ExtBpfProgLoadCallInsn: Error: LDBF BPF program is nil, cannot extract BPF instructions.\n")
++		return
++	}
++	outputFile, err := generateOutputPath(bpfProg.BpfProgFilePath, isBpfRaw)
++	if err != nil {
++		// fmt.Printf("ExtBpfProgLoadCallInsn: Error generates the output file path based on: %s, error:%v\n", bpfProg.BpfProgFilePath, err)
++		return
++	}
++	// 3. Write the final constructed string to the file.
++	// os.WriteFile requires a []byte, so we convert the builder's string.
++	// fmt.Printf("ExtBpfProgLoadCallInsn: Writing to file: %s: %s\n", outputFile, bytes_buffer.String())
++	if err := os.WriteFile(outputFile, []byte(bytes_buffer.String()), 0644); err != nil {
++		// fmt.Printf("ExtBpfProgLoadCallInsn: Error writing formatted bytecode to file: %v\n", err)
++		return
++	}
++
++	bpfProg.BpfRawInsnExtracted = true
++}
+diff --git a/prog/ldbf_map.go b/prog/ldbf_map.go
+new file mode 100644
+index 000000000..dbb9d4339
+--- /dev/null
++++ b/prog/ldbf_map.go
+@@ -0,0 +1,862 @@
++package prog
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"regexp"
++	"strings"
++)
++
++type KeyValSize int
++
++const (
++	KVSize0     KeyValSize = 0
++	KVSize1     KeyValSize = 1
++	KVSize4     KeyValSize = 4
++	KVSize8     KeyValSize = 8
++	KVSize4096  KeyValSize = 4096
++	KVSize8192  KeyValSize = 8192
++	KVSize16384 KeyValSize = 16384
++	KVSize32768 KeyValSize = 32768
++)
++
++const (
++	BPF_F_NO_PREALLOC      KeyValSize = (1 << 0)
++	BPF_F_NO_COMMON_LRU    KeyValSize = (1 << 1)
++	BPF_F_NUMA_NODE        KeyValSize = (1 << 2)
++	BPF_F_RDONLY           KeyValSize = (1 << 3)
++	BPF_F_WRONLY           KeyValSize = (1 << 4)
++	BPF_F_STACK_BUILD_ID   KeyValSize = (1 << 5)
++	BPF_F_ZERO_SEED        KeyValSize = (1 << 6)
++	BPF_F_RDONLY_PROG      KeyValSize = (1 << 7)
++	BPF_F_WRONLY_PROG      KeyValSize = (1 << 8)
++	BPF_F_CLONE            KeyValSize = (1 << 9)
++	BPF_F_MMAPABLE         KeyValSize = (1 << 10)
++	BPF_F_PRESERVE_ELEMS   KeyValSize = (1 << 11)
++	BPF_F_INNER_MAP        KeyValSize = (1 << 12)
++	BPF_F_LINK             KeyValSize = (1 << 13)
++	BPF_F_PATH_FD          KeyValSize = (1 << 14)
++	BPF_F_VTYPE_BTF_OBJ_FD KeyValSize = (1 << 15)
++	BPF_F_TOKEN_FD         KeyValSize = (1 << 16)
++	BPF_F_SEGV_ON_FAULT    KeyValSize = (1 << 17)
++	BPF_F_NO_USER_CONV     KeyValSize = (1 << 18)
++)
++
++func CombineFlags(baseFlag KeyValSize, flags []KeyValSize) []KeyValSize {
++	// Combine the base flag with each flag in the slice
++	combined := make([]KeyValSize, len(flags))
++	for i, flag := range flags {
++		combined[i] = baseFlag | flag
++	}
++	return combined
++}
++
++type BpfMapTypeStruct struct {
++	Name       string
++	MapType    int          // enum BPF_MAP_TYPE_*
++	KeySize    []KeyValSize // key_size
++	ValSize    []KeyValSize // value_size
++	MaxEntries []KeyValSize // max_entries
++	MapFlags   []KeyValSize // map_flags
++	NeedBtf    bool         // whether need BTF
++	NeedInner  bool         // whether need inner_map_fd
++}
++
++var bpfHelperUseReg2ForMap = []string{
++	"BPF_FUNC_perf_event_output",
++	"BPF_FUNC_skb_output",
++	"BPF_FUNC_xdp_output",
++	"BPF_FUNC_tail_call",
++	"BPF_FUNC_timer_init",
++	"BPF_FUNC_sock_map_update",
++	"BPF_FUNC_sock_hash_update",
++	"BPF_FUNC_get_stackid",
++	"BPF_FUNC_skb_under_cgroup",
++	"BPF_FUNC_sk_redirect_map",
++	"BPF_FUNC_msg_redirect_map",
++	"BPF_FUNC_sk_redirect_hash",
++	"BPF_FUNC_sk_select_reuseport",
++	"BPF_FUNC_msg_redirect_hash",
++}
++
++func contains(slice []string, item string) bool {
++	for _, s := range slice {
++		if s == item {
++			return true
++		}
++	}
++	return false
++}
++
++var bpfMapTypeArray = []BpfMapTypeStruct{
++	{
++		Name:       "BPF_MAP_TYPE_UNSPEC",
++		MapType:    0,
++		KeySize:    []KeyValSize{},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_HASH",
++		MapType:    1,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_ARRAY",
++		MapType:    2,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_PROG_ARRAY",
++		MapType:    3,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_PERF_EVENT_ARRAY",
++		MapType:    4,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_PERCPU_HASH",
++		MapType:    5,
++		KeySize:    []KeyValSize{},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_PERCPU_ARRAY",
++		MapType:    6,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_STACK_TRACE",
++		MapType:    7,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize8},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_CGROUP_ARRAY",
++		MapType:    8,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_LRU_HASH",
++		MapType:    9,
++		KeySize:    []KeyValSize{},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_LRU_PERCPU_HASH",
++		MapType:    10,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_LPM_TRIE",
++		MapType:    11,
++		KeySize:    []KeyValSize{KVSize8},
++		ValSize:    []KeyValSize{KVSize8},
++		MaxEntries: []KeyValSize{},
++		MapFlags:   CombineFlags(BPF_F_NO_PREALLOC, []KeyValSize{0, BPF_F_NUMA_NODE, BPF_F_WRONLY, BPF_F_WRONLY_PROG | BPF_F_RDONLY_PROG}),
++	},
++	{
++		Name:       "BPF_MAP_TYPE_ARRAY_OF_MAPS",
++		MapType:    12,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++		NeedInner:  true,
++	},
++	{
++		Name:       "BPF_MAP_TYPE_HASH_OF_MAPS",
++		MapType:    13,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++		NeedInner:  true,
++	},
++	{
++		Name:       "BPF_MAP_TYPE_DEVMAP",
++		MapType:    14,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4, KVSize8},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_SOCKMAP",
++		MapType:    15,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_CPUMAP",
++		MapType:    16,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4, KVSize8},
++		MaxEntries: []KeyValSize{},
++	}, // todo, the max_entries must be smaller or equal to the amount of logical CPUs on the host
++	{
++		Name:       "BPF_MAP_TYPE_XSKMAP",
++		MapType:    17,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_SOCKHASH",
++		MapType:    18,
++		KeySize:    []KeyValSize{KVSize8},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_CGROUP_STORAGE",
++		MapType:    19,
++		KeySize:    []KeyValSize{KVSize8},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{KVSize0},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_REUSEPORT_SOCKARRAY",
++		MapType:    20,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4, KVSize8},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE",
++		MapType:    21,
++		KeySize:    []KeyValSize{KVSize8},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{KVSize0},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_QUEUE",
++		MapType:    22,
++		KeySize:    []KeyValSize{KVSize0},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_STACK",
++		MapType:    23,
++		KeySize:    []KeyValSize{KVSize0},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_SK_STORAGE",
++		MapType:    24,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{KVSize0},
++		MapFlags:   CombineFlags(BPF_F_NO_PREALLOC, []KeyValSize{0, BPF_F_CLONE}),
++		NeedBtf:    true,
++	}, // todo, btf_id and flag
++	{
++		Name:       "BPF_MAP_TYPE_DEVMAP_HASH",
++		MapType:    25,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4, KVSize8},
++		MaxEntries: []KeyValSize{},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_STRUCT_OPS",
++		MapType:    26,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{KVSize1},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_RINGBUF",
++		MapType:    27,
++		KeySize:    []KeyValSize{KVSize0},
++		ValSize:    []KeyValSize{KVSize0},
++		MaxEntries: []KeyValSize{KVSize4096, KVSize8192, KVSize16384, KVSize32768},
++	}, // todo. The max_entries attribute is used to specify the size of the ring-buffer in bytes. It must be a power of 2 and a multiple of the page size (typically 4096), so 4096, 8192, 16384, 32768, ect.
++	{
++		Name:       "BPF_MAP_TYPE_INODE_STORAGE",
++		MapType:    28,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{KVSize0},
++		MapFlags:   CombineFlags(BPF_F_NO_PREALLOC, []KeyValSize{0, BPF_F_CLONE}),
++		NeedBtf:    true,
++	}, // todo, btf_id and flag
++	{
++		Name:       "BPF_MAP_TYPE_TASK_STORAGE",
++		MapType:    29,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{KVSize0},
++		MapFlags:   CombineFlags(BPF_F_NO_PREALLOC, []KeyValSize{0, BPF_F_CLONE}),
++		NeedBtf:    true,
++	}, // todo, btf_id and flag
++	{
++		Name:       "BPF_MAP_TYPE_BLOOM_FILTER",
++		MapType:    30,
++		KeySize:    []KeyValSize{KVSize0},
++		ValSize:    []KeyValSize{},
++		MaxEntries: []KeyValSize{KVSize1},
++	},
++	{
++		Name:       "BPF_MAP_TYPE_USER_RINGBUF",
++		MapType:    31,
++		KeySize:    []KeyValSize{KVSize0},
++		ValSize:    []KeyValSize{KVSize0},
++		MaxEntries: []KeyValSize{KVSize4096, KVSize8192, KVSize16384, KVSize32768},
++	}, // the MaxEntries attribute is used to specify the size of the user ring-buffer in bytes.
++	{
++		Name:       "BPF_MAP_TYPE_CGRP_STORAGE",
++		MapType:    32,
++		KeySize:    []KeyValSize{KVSize4},
++		ValSize:    []KeyValSize{KVSize4},
++		MaxEntries: []KeyValSize{KVSize0},
++		MapFlags:   CombineFlags(BPF_F_NO_PREALLOC, []KeyValSize{0, BPF_F_CLONE}),
++		NeedBtf:    true,
++	}, // todo, btf_id and flag
++	// BPF_MAP_TYPE_ARENA is supported in kernel 6.9 and later
++	// {
++	// 	Name:       "BPF_MAP_TYPE_ARENA",
++	// 	MapType:    33,
++	// 	KeySize:    []KeyValSize{KVSize0},
++	// 	ValSize:    []KeyValSize{KVSize0},
++	// 	MaxEntries: []KeyValSize{KVSize1},
++	// 	MapFlags:   []KeyValSize{BPF_F_MMAPABLE},
++	// },
++}
++
++func selectKeyFields(r *randGen, KeyValField []KeyValSize, defaultSize KeyValSize) (KeyValSize, bool) {
++	// If there are no predefined sizes, do nothing.
++
++	if len(KeyValField) == 0 {
++		return defaultSize, true
++	}
++
++	// 1. Generate a random INDEX for the slice.
++	randomIndex := int(r.rand(len(KeyValField)))
++
++	// 2. Use the index to select ONE element from the allowed sizes.
++	selectedSize := KeyValField[randomIndex]
++
++	return selectedSize, true
++}
++
++// The return value of getBpfMapType is []*BpfMapTypeStruct, whether to load BPF Map
++func (Ldbf *LLMDrivenBPFuzzer) getBpfMapTypes(r *randGen, s *state, bpfProg *BpfProg) ([]*BpfMapTypeStruct, []int, bool) {
++	LDBFDir := os.Getenv("LDBF_DIR") + "/"
++	if LDBFDir == "/" {
++		panic("LDBF_DIR environment variable is not set")
++	}
++
++	helperMapTypeFile := LDBFDir + "dependency/func_map.json"
++	dependenciesJSON, err := ReadFileContent(helperMapTypeFile)
++	if err != nil {
++		return nil, nil, false
++	}
++
++	var supportedMapTypes map[string][]string
++
++	supportedMapTypes, bpfLoadMapInsnIndex, err := extractSupportedMapTypes(bpfProg, dependenciesJSON)
++	if err != nil {
++		return nil, nil, false
++	}
++
++	if len(bpfMapTypeArray) == 0 {
++		panic("bpfMapTypeArray is empty, cannot select a map type")
++	}
++
++	// When no BPF map instance is found, an empty slice is returned.
++	if len(supportedMapTypes) == 0 {
++		// No BPF map instances found (via BPF_LD_MAP_FD), selecting randomly from all types.
++		// fmt.Println("No BPF map instances found (via BPF_LD_MAP_FD), selecting randomly from all types.")
++		randomIndex := int(r.rand(len(bpfMapTypeArray)))
++		tempMapType := &bpfMapTypeArray[randomIndex]
++
++		mapTypeCopy := new(BpfMapTypeStruct)
++		*mapTypeCopy = *tempMapType
++
++		// Add a copy of the map type created for the current instance to the final result slice
++		resultMaps := make([]*BpfMapTypeStruct, 0, 1)
++		resultMaps = append(resultMaps, mapTypeCopy)
++
++		// fmt.Printf("Selected map type: %s\n", mapTypeCopy.Name)
++		// fmt.Printf("Total maps selected: %d\n\n", len(resultMaps))
++		return resultMaps, bpfLoadMapInsnIndex, false
++	}
++
++	// Select a map type for each map instance found in the BPF program
++
++	// Create the final result slice, pre-allocating capacity for efficiency
++	resultMaps := make([]*BpfMapTypeStruct, 0, len(supportedMapTypes))
++
++	// Iterate over each map instance (mapInstanceID) and the list of map type names it supports (mapTypeNames)
++	for mapInstanceID, mapTypeNames := range supportedMapTypes {
++		// fmt.Printf("Supported map types for instance %s: %v\n", mapInstanceID, mapTypeNames)
++
++		// Select independently for the current map instance
++		var tempMapType *BpfMapTypeStruct
++
++		// Creates a temporary set of the map type name for the current instance.
++		instanceAllowedNames := make(map[string]struct{})
++		for _, name := range mapTypeNames {
++			instanceAllowedNames[name] = struct{}{}
++		}
++
++		// Iterate over the global bpfMapTypeArray to find matching candidates for the current instance
++		var instanceCandidates []*BpfMapTypeStruct
++		for i := range bpfMapTypeArray {
++			if _, ok := instanceAllowedNames[bpfMapTypeArray[i].Name]; ok {
++				instanceCandidates = append(instanceCandidates, &bpfMapTypeArray[i])
++			}
++		}
++
++		// Randomly select one from the candidates of the current instance
++		if len(instanceCandidates) > 0 {
++			// fmt.Printf("Found %d candidate(s) for instance '%s', selecting one randomly.\n", len(instanceCandidates), mapInstanceID)
++			randomIndex := int(r.rand(len(instanceCandidates)))
++			tempMapType = instanceCandidates[randomIndex]
++		} else {
++			// If none of the types supported by the current instance are found in the main array
++			// fmt.Printf("Warning: No matching types in master list for instance '%s'. Falling back to random selection.\n", mapInstanceID)
++			randomIndex := int(r.rand(len(bpfMapTypeArray)))
++			tempMapType = &bpfMapTypeArray[randomIndex]
++		}
++
++		// Dynamic allocation and copying ensure that each returned element is an independent copy
++		if tempMapType == nil {
++			// In theory it shouldn't happen because there is fallback logic, but as a safety check
++			panic(fmt.Sprintf("Failed to select a map type for instance '%s'", mapInstanceID))
++		}
++		mapTypeCopy := new(BpfMapTypeStruct)
++		*mapTypeCopy = *tempMapType
++		// fmt.Printf("Selected for instance '%s': %s\n", mapInstanceID, mapTypeCopy.Name)
++
++		// Add a copy of the map type created for the current instance to the final result slice
++		resultMaps = append(resultMaps, mapTypeCopy)
++	}
++	// fmt.Printf("Total maps selected: %d\n\n", len(resultMaps))
++	return resultMaps, bpfLoadMapInsnIndex, true
++}
++
++// calculateIntersection calculates the intersection.
++// Return value:
++// 1. []string: The calculated intersection result.
++// 2. bool: A flag. If true, it means that all map types should be supported (because all associated helpers are undefined).
++func calculateIntersection(helpers []string, dependencies map[string][]string) ([]string, bool) {
++	// Filter out helpers that are explicitly defined in dependencies
++	var definedHelpers []string
++	for _, h := range helpers {
++		if _, found := dependencies[strings.ToUpper(h)]; found {
++			definedHelpers = append(definedHelpers, h)
++		}
++	}
++
++	// If no helper is defined, all map types should be supported.
++	if len(definedHelpers) == 0 {
++		// Returns a true flag to inform the caller to use the "all types" list
++		return nil, true
++	}
++
++	// At least one helper is defined, and the intersection is calculated based on these defined helpers
++	// Initialize the intersection using the first defined helper
++	firstHelperName := strings.ToUpper(definedHelpers[0])
++	initialMapTypes := dependencies[firstHelperName]
++
++	intersectionSet := make(map[string]struct{})
++	for _, mt := range initialMapTypes {
++		intersectionSet[mt] = struct{}{}
++	}
++
++	// Traverse the remaining defined helpers and keep reducing the intersection
++	for i := 1; i < len(definedHelpers); i++ {
++		nextHelperName := strings.ToUpper(definedHelpers[i])
++		nextMapTypes := dependencies[nextHelperName]
++
++		currentHelperSet := make(map[string]struct{})
++		for _, mt := range nextMapTypes {
++			currentHelperSet[mt] = struct{}{}
++		}
++
++		nextIntersectionSet := make(map[string]struct{})
++		for mt := range intersectionSet {
++			if _, ok := currentHelperSet[mt]; ok {
++				nextIntersectionSet[mt] = struct{}{}
++			}
++		}
++		intersectionSet = nextIntersectionSet
++		if len(intersectionSet) == 0 {
++			break
++		}
++	}
++
++	// Convert the final intersection set back into a string slice
++	result := make([]string, 0, len(intersectionSet))
++	for mt := range intersectionSet {
++		result = append(result, mt)
++	}
++
++	// Returns the calculated intersection and the false flag
++	return result, false
++}
++
++func extractSupportedMapTypes(bpfProg *BpfProg, jsonDependencies string) (map[string][]string, []int, error) {
++	var mapLoadRegex = regexp.MustCompile(`BPF_LD_MAP_FD\((\w+),\s*(0x[0-9a-fA-F]+|\d+)\)`)
++	var helperRegex = regexp.MustCompile(`(?:BPF_RAW_INSN|BPF_EMIT_CALL)\((?:.*,\s*)?(\w+)\)`)
++	var otherRegWriteRegex = regexp.MustCompile(`\b(BPF_MOV64_REG|BPF_MOV64_IMM|BPF_ALU64_REG|BPF_ALU64_IMM|BPF_LDX_MEM)\((BPF_REG_[1-2]),`)
++
++	var mapValueLoadRegex = regexp.MustCompile(`BPF_LD_MAP_VALUE`)
++	var ldImm64Regex = regexp.MustCompile(`BPF_LD_IMM64(?:_RAW(?:_FULL)?)?`)
++
++	var dependencies map[string][]string
++	if err := json.Unmarshal([]byte(jsonDependencies), &dependencies); err != nil {
++		return nil, nil, fmt.Errorf("fail to parse JSON file: %w", err)
++	}
++
++	// Convert the contents of dependencies to all uppercase
++	upperDependencies := make(map[string][]string)
++	for key, valueSlice := range dependencies {
++		upperKey := strings.ToUpper(key)
++		upperValueSlice := make([]string, len(valueSlice))
++		for i, value := range valueSlice {
++			upperValueSlice[i] = strings.ToUpper(value)
++		}
++		upperDependencies[upperKey] = upperValueSlice
++	}
++	dependencies = upperDependencies
++
++	allMapTypeSet := make(map[string]struct{})
++	for _, mapTypes := range dependencies {
++		for _, mt := range mapTypes {
++			allMapTypeSet[mt] = struct{}{}
++		}
++	}
++	allMapTypeNames := make([]string, 0, len(allMapTypeSet))
++	for mt := range allMapTypeSet {
++		allMapTypeNames = append(allMapTypeNames, mt)
++	}
++
++	lines := strings.Split(bpfProg.BpfProgContent, "\n")
++	mapHelpers := make(map[string][]string)
++	var bpfLoadMapInsnIndex []int
++	var loadMapInsnIndex int = 0
++
++	var isReg1FromMapFD bool = false
++	var isReg2FromMapFD bool = false
++	// lastReg1MapLoadIndex records the index of the last instruction that loaded an FD into BPF_REG_1 or BPF_REG_2.
++	var lastReg1MapLoadIndex int = -1
++	var lastReg2MapLoadIndex int = -1
++	// mapIDToInsnIndex associates a map instance ID with the index of its BPF_LD_MAP_FD instruction.
++	mapIDToInsnIndex := make(map[string]int)
++	var mapIdx int = 0
++
++	for _, line := range lines {
++		// Detecting BPF_LD_MAP_FD instructions
++		if match := mapLoadRegex.FindStringSubmatch(line); len(match) > 2 {
++			destReg := match[1]
++			if destReg == "BPF_REG_1" {
++				isReg1FromMapFD = true
++				lastReg1MapLoadIndex = loadMapInsnIndex
++			} else if destReg == "BPF_REG_2" {
++				isReg2FromMapFD = true
++				lastReg2MapLoadIndex = loadMapInsnIndex
++			}
++			// Check for other instructions that overwrite BPF_REG_1.
++		} else if match := otherRegWriteRegex.FindStringSubmatch(line); len(match) > 2 {
++			destReg := match[2]
++			if destReg == "BPF_REG_1" {
++				isReg1FromMapFD = false
++			} else if destReg == "BPF_REG_2" {
++				isReg2FromMapFD = false
++			}
++			// Check for helper function call.
++		} else if match := helperRegex.FindStringSubmatch(line); len(match) > 1 {
++			// If the state of BPF_REG_1 is from a map FD, this helper is map-dependent.
++			helperName := match[1]
++			// If the helper use BPF_REG_2 as map FD source, also check its state.
++			if contains(bpfHelperUseReg2ForMap, helperName) && isReg2FromMapFD {
++				mapID := ""
++				for id, index := range mapIDToInsnIndex {
++					if index == lastReg2MapLoadIndex {
++						mapID = id
++						break
++					}
++				}
++
++				// If not yet recorded, create it now.
++				if mapID == "" {
++					// mapID = fmt.Sprintf("map_idx_%d", mapIdx)
++					mapIDToInsnIndex[mapID] = lastReg2MapLoadIndex
++					mapHelpers[mapID] = []string{}
++					bpfLoadMapInsnIndex = append(bpfLoadMapInsnIndex, lastReg2MapLoadIndex)
++					mapIdx++
++				}
++				mapHelpers[mapID] = append(mapHelpers[mapID], helperName)
++				//fmt.Printf("Associated reg2 map-dependent helper '%s' with %s (from insn %d)\n", helperName, mapID, lastReg2MapLoadIndex)
++			} else if isReg1FromMapFD {
++				// Check if this map instance has already been recorded.
++				mapID := ""
++				for id, index := range mapIDToInsnIndex {
++					if index == lastReg1MapLoadIndex {
++						mapID = id
++						break
++					}
++				}
++
++				// If not yet recorded, create it now.
++				if mapID == "" {
++					// mapID = fmt.Sprintf("map_idx_%d", mapIdx)
++					mapIDToInsnIndex[mapID] = lastReg1MapLoadIndex
++					mapHelpers[mapID] = []string{}
++					bpfLoadMapInsnIndex = append(bpfLoadMapInsnIndex, lastReg1MapLoadIndex)
++					mapIdx++
++				}
++
++				mapHelpers[mapID] = append(mapHelpers[mapID], helperName)
++				//fmt.Printf("Associated map-dependent helper '%s' with %s (from insn %d)\n", helperName, mapID, lastReg1MapLoadIndex)
++			}
++			// Any helper call clobbers the state of R, so always reset it.
++			isReg1FromMapFD = false
++			isReg2FromMapFD = false
++		}
++
++		// When a BPF_LD_MAP_VALUE instruction is found, it is considered to be a bpf map load instruction.
++		if mapValueLoadRegex.MatchString(line) {
++			// fmt.Printf("Found BPF_LD_MAP_VALUE at line %d, from the BPF program: %s\n\n", loadMapInsnIndex, bpfProg.BpfProgFilePath)
++			panic("Ldbf: BPF_LD_MAP_VALUE instruction found, which is not supported in this context. TODO.")
++		}
++		if ldImm64Regex.MatchString(line) {
++			loadMapInsnIndex++ // Additional 1
++		}
++		loadMapInsnIndex++
++	}
++
++	// fmt.Printf("Extracted %d map instances from the BPF program: %s\n", len(mapHelpers), bpfProg.BpfProgFilePath)
++	// fmt.Printf("Found %d BPF_LD_MAP_FD instructions in the program content:\n%s\n", len(bpfLoadMapInsnIndex), bpfProg.BpfProgContent)
++
++	// Calculate the supported map types for each map group
++	mapsHelpersMap := make(map[string][]string)
++	for mapID, helpers := range mapHelpers {
++		// Call the modified intersection function
++		intersectedMapTypes, useAllTypes := calculateIntersection(helpers, dependencies)
++
++		if useAllTypes {
++			// If the flag is true, use the pre-generated list of all map types
++			mapsHelpersMap[mapID] = allMapTypeNames
++		} else {
++			// Otherwise, use the calculated intersection result
++			mapsHelpersMap[mapID] = intersectedMapTypes
++		}
++		// fmt.Printf("For %s, supported map types: %v, based on helpers: %v, from program:%s\n\n", mapID, mapsHelpersMap[mapID], helpers, bpfProg.BpfProgFilePath)
++	}
++	// map types list |
++	return mapsHelpersMap, bpfLoadMapInsnIndex, nil
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfMapCreateCall(r *randGen, s *state, bpfProg *BpfProg) []*Call {
++	// find the map type the bpfinsn supports
++	supportedMapTypes, bpfLoadMapInsnIndex, needLoadMapFd := Ldbf.getBpfMapTypes(r, s, bpfProg)
++
++	if supportedMapTypes == nil {
++		// fmt.Printf("\nSelected BpfProgFilePath: %s\n", bpfProg.BpfProgFilePath)
++		panic("Ldbf: genLdbfMapCreateCall no supported BPF map types found")
++	}
++
++	var bpfMapCalls []*Call
++	var bpfMapRes []*ResultArg
++
++	for _, mapType := range supportedMapTypes {
++		calls := genSingleMapCreateCall(r, s, bpfProg, mapType)
++		if len(calls) == 0 {
++			continue
++		}
++		c := calls[len(calls)-1]
++
++		val := uint64(mapType.MapType)
++		bpfProg.BpfProgContext.MapTypes = append(bpfProg.BpfProgContext.MapTypes, val)
++
++		if needLoadMapFd {
++			bpfMapRes = append(bpfMapRes, c.Ret)
++		}
++
++		var currentBpfMapCall []*Call
++		//currentBpfMapCall = append(currentBpfMapCall, calls...)     // First add resource related calls
++		//currentBpfMapCall = append(currentBpfMapCall, moreCalls...) // Then add the call to the conditional field
++		currentBpfMapCall = append(currentBpfMapCall, calls...) // Finally add the MAP_CREATE call itself
++
++		bpfMapCalls = append(bpfMapCalls, currentBpfMapCall...)
++	}
++
++	if bpfProg.BpfMapResMap == nil {
++		bpfProg.BpfMapResMap = make(map[int]*ResultArg, len(bpfLoadMapInsnIndex))
++	}
++
++	if needLoadMapFd {
++		if len(bpfLoadMapInsnIndex) != len(bpfMapRes) {
++			// fmt.Printf("Assign to map failed: array lengths are not equal (%d != %d)", len(bpfLoadMapInsnIndex), len(bpfMapRes))
++			// panic("Ldbf: genLdbfMapCreateCall: bpfLoadMapInsnIndex and bpfMapRes length mismatch")
++		} else {
++			for mapIndex, loadMapIndex := range bpfLoadMapInsnIndex {
++				bpfProg.BpfMapResMap[loadMapIndex] = bpfMapRes[mapIndex]
++			}
++		}
++	}
++
++	return bpfMapCalls
++}
++
++// Separate the creation of the bpf$LDBF_MAP_CREATE into genSingleMapCreateCall
++func genSingleMapCreateCall(r *randGen, s *state, bpfProg *BpfProg, mapType *BpfMapTypeStruct) []*Call {
++	var calls []*Call
++	meta := r.target.SyscallMap["bpf$LDBF_MAP_CREATE"]
++	//meta := r.target.SyscallMap["bpf$MAP_CREATE"]
++	c := MakeCall(meta, nil)
++
++	argCalls, _ := r.generateArgs(s, meta.Args, DirIn)
++	c.Args = argCalls
++
++	// bpf_map_create_arg ptr
++	cArgField, ok := c.Args[1].Type().(*PtrType)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a pointer type, got %T\n", c.Args[1].Type())
++		return calls
++	}
++
++	// bpf_map_create_arg union
++	bpfMapCreateArgType, ok := cArgField.Elem.(*UnionType)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: cArgField.Elem is not a UnionType, got %T\n", cArgField.Elem)
++		return calls
++	}
++	bpfMapCreateArgTypeDir := cArgField.ElemDir
++
++	// bpf_map_create_arg_base index
++	bpfMapCreateArgBaseIdx := 0
++	bpfMapCreateArgBaseType := bpfMapCreateArgType.Fields[bpfMapCreateArgBaseIdx].Type
++	bpfMapCreateArgType.Fields[bpfMapCreateArgBaseIdx].Dir(cArgField.ElemDir)
++
++	// bpf_map_create_arg_base, bpf_map_create_arg_t struct
++	bpfMapCreateArgT, ok := bpfMapCreateArgBaseType.(*StructType)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: bpfMapCreateArgBaseType is not a StructType, got %T\n", bpfMapCreateArgBaseType)
++		return calls
++	}
++	bpfMapCreateArgTDir := bpfMapCreateArgType.Fields[bpfMapCreateArgBaseIdx].Dir(bpfMapCreateArgTypeDir)
++
++	// bpf_map_create_arg ptr arg
++	ptrArg, ok := c.Args[1].(*PointerArg)
++	if !ok || ptrArg.Res == nil {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a PointerArg, got %T\n", c.Args[1])
++		return calls
++	}
++
++	// bpf_map_create_arg union arg
++	unionArg, ok := ptrArg.Res.(*UnionArg)
++	if !ok || unionArg.Option == nil {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1].Res is not a UnionArg, got %T\n", ptrArg.Res)
++		return calls
++	}
++
++	// bpf_map_create_arg_t struct arg
++	originalStructArg, ok := unionArg.Option.(*GroupArg)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: unionArg.Option is not a GroupArg, got %T\n", unionArg.Option)
++		return calls
++	}
++
++	for bpfMapCreateArgTIdx, bpfMapCreateArgTField := range bpfMapCreateArgT.Fields {
++		var newArg Arg
++
++		bpfMapCreateArgTFieldDir := bpfMapCreateArgTField.Dir(bpfMapCreateArgTDir)
++		switch bpfMapCreateArgTIdx {
++		case 0: // map_type, type
++			val := uint64(mapType.MapType)
++			newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, val)
++
++		case 1: // key_size, ksize
++			if KeySize, ok := selectKeyFields(r, mapType.KeySize, KeyValSize((r.rand(20)+1)*4)); ok {
++				newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, uint64(KeySize))
++			}
++
++		case 2: // value_size, vsize
++			if ValSize, ok := selectKeyFields(r, mapType.ValSize, KeyValSize((r.rand(20)+1)*4)); ok {
++				newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, uint64(ValSize))
++			}
++
++		case 3: // max_entries, max
++			if MaxEntries, ok := selectKeyFields(r, mapType.MaxEntries, KeyValSize((r.rand(20)+1)*4)); ok {
++				newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, uint64(MaxEntries))
++			}
++		case 4: // map_flags, flag
++			if MapFlags, ok := selectKeyFields(r, mapType.MapFlags, KVSize0); ok {
++				newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTField.Dir(bpfMapCreateArgTDir), uint64(MapFlags))
++			}
++
++		case 6, 12, 13: // Initialize other ConstArg parameters to 0
++			newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, 0)
++
++		case 9: // btf_fd
++			if mapType.NeedBtf {
++				newArg = MakeResultArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, bpfProg.BtfRes, 0)
++			} else {
++				newArg = MakeResultArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, nil, 0)
++			}
++
++		case 10, 11: //btf_key_type_id btf_value_type_id
++			if mapType.NeedBtf {
++				newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, 1)
++			} else {
++				newArg = MakeConstArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, 0)
++			}
++
++		case 5: // inner_map_fd
++			if mapType.NeedInner {
++				InnerMap := genSingleMapCreateCall(r, s, bpfProg, &bpfMapTypeArray[r.rand(32)+1]) // Use BPF_MAP_TYPE_HASH as the inner map type
++				if InnerMap != nil && len(InnerMap) > 0 {
++					calls = append(calls, InnerMap...)
++					newArg = MakeResultArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, InnerMap[len(InnerMap)-1].Ret, 0)
++				} else {
++					newArg = MakeResultArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, nil, 0)
++				}
++			} else {
++				newArg = MakeResultArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, nil, 0)
++			}
++		case 8:
++			newArg = MakeResultArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, nil, 0)
++
++		case 7:
++			//newArg = MakeDataArg(bpfMapCreateArgTField.Type, bpfMapCreateArgTFieldDir, nil)
++
++		default:
++			// fmt.Printf("Ldbf: genLdbfMapCreateCall: bpfMapCreateArgTIdx %d, Got type: %T\n", bpfMapCreateArgTIdx, bpfMapCreateArgTField.Type)
++		}
++
++		// If newArg is successfully created (not nil), the replacement is performed
++		if newArg != nil {
++			replaceArg(originalStructArg.Inner[bpfMapCreateArgTIdx], newArg)
++		}
++	}
++
++	//moreCalls, _ := r.patchConditionalFields(c, s)
++	r.patchConditionalFields(c, s)
++	r.target.assignSizesCall(c)
++	calls = append(calls, c)
++	return calls
++}
+diff --git a/prog/ldbf_prog.go b/prog/ldbf_prog.go
+new file mode 100644
+index 000000000..29c671f74
+--- /dev/null
++++ b/prog/ldbf_prog.go
+@@ -0,0 +1,1040 @@
++package prog
++
++import (
++	"bufio"
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"math/rand"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++)
++
++type BrfGenProgOpt struct {
++	genProgAttempt int
++	useTestSrc     bool
++}
++
++type BpfProgContext struct {
++	MapTypes           []uint64
++	ProgType           uint64
++	ExpectedAttachType uint64
++	ProgFD             *ResultArg
++}
++
++type BpfProg struct {
++	BasePath            string
++	UseTestSrc          bool
++	PythonPath          string
++	BpfProgFilePath     string
++	BpfProgContent      string
++	BpfRawInsnFilePath  string
++	BpfRawInsnString    string
++	BpfMapResMap        map[int]*ResultArg
++	BtfRes              *ResultArg
++	BpfRawInsnExtracted bool
++	BpfProgContext      BpfProgContext
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) GetLdbfBpfProg() *BpfProg {
++	return Ldbf.bpfProg
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) NewLdbfProg(r *randGen, opt BrfGenProgOpt) *BpfProg {
++	bpfProg := &BpfProg{}
++
++	LDBFDir := os.Getenv("LDBF_DIR") + "/"
++	if LDBFDir == "/" {
++		panic("LDBF_DIR environment variable is not set")
++	}
++
++	pythonPathBytes, err := os.ReadFile(LDBFDir + ".pdm-python")
++	if err != nil {
++		fmt.Println("Error reading .pdm-python: %w", err)
++		return nil
++	}
++	bpfProg.PythonPath = strings.TrimSpace(string(pythonPathBytes))
++
++	genBpfSeedDir := filepath.Join(os.Getenv("LDBF_LORA_DIR"), "seeds")
++	if genBpfSeedDir == "seeds/" {
++		// fmt.Println("Warning: LDBF_LORA_DIR environment variable is not set. Falling back to LDBF_DIR.")
++		genBpfSeedDir = LDBFDir + "generate-seeds"
++	}
++
++	bpfProg.BpfProgFilePath, bpfProg.BpfProgContent, err = SelectRandomFileAndRead(genBpfSeedDir)
++	if err != nil {
++		return nil
++	}
++
++	if bpfProg.BpfProgContent == "" {
++		// fmt.Println("BpfProgContent is empty, no BPF instructions found in the selected file.")
++		return nil
++	}
++
++	if os.Getenv("LDBF_REUSE_BPF_INSN") == "" {
++		bpfProgExecuated, err := Ldbf.CheckBpfProgExecuated(bpfProg)
++		if err != nil {
++			// fmt.Printf("Error checking BPF program is executed: %v\n", err)
++			return nil
++		}
++		if bpfProgExecuated {
++			return nil
++		}
++	}
++
++	// fmt.Println("Ldbf_prog: GenBpfInsnMap:")
++	// for k, v := range BpfProg.GenBpfInsnMap {
++	// 	fmt.Printf("\tbpfprog.GenBpfInsnMap %s: %s\n", k, v)
++	// }
++
++	return bpfProg
++}
++
++func TranslateBpfProg(bpfProg *BpfProg) *BpfProg {
++	LDBFDir := os.Getenv("LDBF_DIR") + "/"
++	if LDBFDir == "/" {
++		panic("LDBF_DIR environment variable is not set")
++	}
++
++	if bpfProg.PythonPath == "" {
++		// fmt.Println("Uninitialized PythonPath")
++		return bpfProg
++	}
++
++	BpfRawInsnFilePath := bpfProg.BpfProgFilePath + ".json"
++
++	var stdoutBuf bytes.Buffer
++	var stderrBuf bytes.Buffer
++	cmd := exec.Command(bpfProg.PythonPath,
++		LDBFDir+"translator/translate.py",
++		bpfProg.BpfProgFilePath,
++		BpfRawInsnFilePath)
++
++	cmd.Stdout = &stdoutBuf
++	cmd.Stderr = &stderrBuf
++
++	err := cmd.Run()
++
++	if err != nil && os.Getenv("LDBF_DEBUG_BPF_INSN") != "" {
++		bpfProg.BpfRawInsnFilePath = ""
++		return bpfProg
++	}
++
++	bpfProg.BpfRawInsnFilePath = BpfRawInsnFilePath
++	// fmt.Printf("\tTranslated File Path: %s\n", BpfRawInsnFilePath)
++
++	return bpfProg
++}
++
++func ExtractBpfRawInsn(filename string) (string, error) {
++	jsonDataBytes, err := os.ReadFile(filename)
++	if err != nil {
++		return "", fmt.Errorf("error reading file '%s': %w", filename, err)
++	}
++
++	var data map[string]interface{}
++	err = json.Unmarshal(jsonDataBytes, &data)
++	if err != nil {
++		return "", fmt.Errorf("error unmarshalling JSON from '%s': %w", filename, err)
++	}
++
++	bpfRawInsnInterface, found := data["bpf_insn"]
++	if !found {
++		return "", fmt.Errorf("key 'bpf_insn' not found in JSON file '%s'", filename)
++	}
++
++	BpfRawInsnString, ok := bpfRawInsnInterface.(string)
++	if !ok {
++		return "", fmt.Errorf("value for key 'bpf_insn' in '%s' is not a string (type: %T)", filename, bpfRawInsnInterface)
++	}
++
++	return BpfRawInsnString, nil
++}
++
++func FillExtractBpfRawInsn(bpfProg *BpfProg) *BpfProg {
++	BpfRawInsnString, err := ExtractBpfRawInsn(bpfProg.BpfRawInsnFilePath)
++
++	if err != nil {
++		// fmt.Printf("Error extracting BPF instructions: %v\n", err)
++		bpfProg.BpfRawInsnString = ""
++		return bpfProg
++	}
++
++	bpfProg.BpfRawInsnString = BpfRawInsnString
++	return bpfProg
++}
++
++func JoinLdbfLoraDir(suffix string) (string, error) {
++	execuatedDir := os.Getenv("LDBF_LORA_DIR")
++	if execuatedDir == "" {
++		// fmt.Println("Warning: LDBF_LORA_DIR environment variable is not set. Falling back to LDBF_DIR.")
++		ldbfDir := os.Getenv("LDBF_DIR")
++		execuatedDir = filepath.Join(ldbfDir, "generate-seeds")
++	}
++
++	finalDir := filepath.Join(execuatedDir, suffix)
++	if err := os.MkdirAll(finalDir, 0755); err != nil {
++		return "", fmt.Errorf("failed to create execuated directory '%s': %w", finalDir, err)
++	}
++	return finalDir, nil
++}
++
++func GetExecuatedDir() (string, error) {
++	return JoinLdbfLoraDir("execuated")
++}
++
++func (LDBF *LLMDrivenBPFuzzer) CheckBpfProgExecuated(bpfProg *BpfProg) (bool, error) {
++	finalDir, err := GetExecuatedDir()
++	if err != nil {
++		return false, err
++	}
++	destPath := filepath.Join(finalDir, filepath.Base(bpfProg.BpfProgFilePath))
++	_, err = os.Stat(destPath)
++	if os.IsNotExist(err) {
++		return false, nil
++	} else if err != nil {
++		return false, fmt.Errorf("failed to check file '%s': %w", destPath, err)
++	}
++	return true, nil
++}
++
++func (LDBF *LLMDrivenBPFuzzer) MarkBpfProgAsExecuated(bpfProg *BpfProg) (bool, error) {
++	finalDir, err := GetExecuatedDir()
++	if err != nil {
++		return false, err
++	}
++	destPath := filepath.Join(finalDir, filepath.Base(bpfProg.BpfProgFilePath))
++	err = os.Symlink(bpfProg.BpfProgFilePath, destPath)
++	if err != nil {
++		return false, fmt.Errorf("failed to create symlink from '%s' to '%s': %w", bpfProg.BpfProgFilePath, destPath, err)
++	}
++	return true, nil
++}
++
++// BPF instruction classes and codes
++const (
++	// Each BPF instruction is represented by 5 uint64 elements.
++	RAW_INSN_PER_LEN = 5
++
++	// For BPF_MOV64_IMM
++	BPF_ALU64     = 0x07
++	BPF_MOV       = 0xb0
++	BPF_K         = 0x00
++	BPF_MOV64_IMM = BPF_ALU64 | BPF_MOV | BPF_K // 0xb7
++
++	// For BPF_LD_IMM64
++	BPF_LD       = 0x00
++	BPF_DW       = 0x18
++	BPF_IMM      = 0x00
++	BPF_LD_IMM64 = BPF_LD | BPF_DW | BPF_IMM // 0x18
++
++	// Registers and pseudo-registers
++	BPF_REG_0         = 0
++	BPF_REG_1         = 1
++	BPF_REG_2         = 2
++	BPF_PSEUDO_MAP_FD = BPF_REG_1
++)
++
++// ParseRawInsnAssignArgs iterates through a BPF instruction stream.
++// It identifies all BPF_LD_MAP_FD pseudo-instructions. If the destination
++// register of such an instruction is neither BPF_REG_1 nor BPF_REG_2, it replaces
++// the 10-element (16-byte) pseudo-instruction with a 5-element (8-byte)
++// BPF_MOV64_IMM instruction.
++// BPF_REG_1 and BPF_REG_2 are preserved because they are used by helper functions
++// that accept map FDs as arguments (e.g., BPF_FUNC_map_lookup_elem uses R1,
++// BPF_FUNC_tail_call uses R2).
++func ParseRawInsnAssignArgs(r *randGen, result []uint64) []uint64 {
++	var newResult []uint64
++	newResult = make([]uint64, 0, len(result))
++	patchRate := 0.8
++
++	if r.Float64() > patchRate {
++		return result
++	}
++
++	i := 0
++	for i < len(result) {
++		// Check if there are enough elements left for a potential LD_MAP_FD (2 instructions).
++		if i+(2*RAW_INSN_PER_LEN) > len(result) {
++			newResult = append(newResult, result[i:]...)
++			break
++		}
++
++		code1 := result[i]
++		code2 := result[i+RAW_INSN_PER_LEN]
++
++		dstReg := result[i+1]
++		srcReg := result[i+2]
++
++		// fmt.Printf("Inspecting instructions at index %d and %d: code1=0x%x, dstReg=%d, srcReg=%d, code2=0x%x\n", i/RAW_INSN_PER_LEN, (i/RAW_INSN_PER_LEN)+1, code1, dstReg, srcReg, code2)
++
++		// Check for the BPF_LD_MAP_FD pseudo-instruction pattern:
++		// Insn 1: opcode=LD_IMM64, src_reg=BPF_PSEUDO_MAP_FD
++		// Insn 2: opcode=0
++		if code1 == BPF_LD_IMM64 && srcReg == BPF_PSEUDO_MAP_FD && code2 == 0 {
++			// It's a BPF_LD_MAP_FD. Now check the destination register.
++			// fmt.Printf("Found BPF_LD_MAP_FD at instruction index %d, dstReg=%d\n", i/RAW_INSN_PER_LEN, dstReg)
++			// BPF_REG_2 is defined as 2
++			if dstReg != BPF_REG_1 && dstReg != BPF_REG_2 {
++				// Condition met: Replace with BPF_MOV64_IMM(dstReg, 0).
++				// fmt.Printf("Replacing BPF_LD_MAP_FD(R%d, ...) at index %d with BPF_MOV64_IMM(R%d, 0)\n", dstReg, i/RAW_INSN_PER_LEN, dstReg)
++
++				// For BPF_MOV64_IMM, src_reg is 0. The regs field is just dstReg.
++				newRegs := dstReg
++				movInsn := []uint64{BPF_MOV64_IMM, newRegs, 0, 0, 0}
++				newResult = append(newResult, movInsn...)
++
++				// Skip the original 2 instructions (10 elements).
++				i += 2 * RAW_INSN_PER_LEN
++			} else {
++				// It's a valid LD_MAP_FD(BPF_REG_1, ...) or LD_MAP_FD(BPF_REG_2, ...), so we keep it.
++				newResult = append(newResult, result[i:i+(2*RAW_INSN_PER_LEN)]...)
++				i += 2 * RAW_INSN_PER_LEN
++			}
++		} else {
++			// It's not a LD_MAP_FD, copy the single instruction as is.
++			newResult = append(newResult, result[i:i+RAW_INSN_PER_LEN]...)
++			i += RAW_INSN_PER_LEN
++		}
++	}
++	return newResult
++}
++
++// ParseRawInsnReturnCode handles a special case:
++// If the last instruction before a BPF program exit sets R0 with a value greater than 1,
++// this function forces that immediate value to 0 or 1.
++func ParseRawInsnReturnCode(r *randGen, result []uint64) {
++	RAW_INSN_PER_LEN := 5
++	numInsns := len(result) / RAW_INSN_PER_LEN
++	// patchRate := 0.8
++	immToZeroRate := 0.5
++	var newImm uint64
++
++	// if r.Float64() > patchRate {
++	// 	return
++	// }
++
++	// Randomly choose the new immediate value (0 or 1)
++	if r.Float64() < immToZeroRate {
++		newImm = 0
++	} else {
++		newImm = 1
++	}
++
++	// Check for BPF_LD_IMM64(BPF_REG_0, IMM)
++	// This is a 2-instruction sequence, so we need at least 3 instructions total
++	// (LD_IMM_PART1, LD_IMM_PART2, EXIT).
++	if numInsns >= 3 {
++		thirdLastInsnIndex := (numInsns - 3) * RAW_INSN_PER_LEN
++		secondLastInsnIndex := (numInsns - 2) * RAW_INSN_PER_LEN
++
++		codePart1 := result[thirdLastInsnIndex]
++		regsPart1 := result[thirdLastInsnIndex+1]
++		codePart2 := result[secondLastInsnIndex] // The second part of LD_IMM64 has opcode 0
++
++		// Check if the pattern matches BPF_LD_IMM64(BPF_REG_0, ...)
++		if codePart1 == BPF_LD_IMM64 && regsPart1 == BPF_REG_0 && codePart2 == 0 {
++			// Reconstruct the original 64-bit immediate for logging purposes
++			// originalImmLow := result[thirdLastInsnIndex+4]
++			// originalImmHigh := result[secondLastInsnIndex+4]
++			// originalImm := (originalImmHigh << 32) | originalImmLow
++
++			// fmt.Printf("Found BPF_LD_IMM64 with R0 at instruction index %d, original IMM=0x%x. Modifying to 0x%x.\n",
++			// thirdLastInsnIndex/RAW_INSN_PER_LEN, originalImm, newImm)
++
++			// Write the new immediate back, split into lower and upper 32 bits
++			result[thirdLastInsnIndex+4] = newImm
++			result[secondLastInsnIndex+4] = 0
++
++			return
++		}
++	}
++
++	// This logic is preserved and runs only if the BPF_LD_IMM64 case above was not found.
++	// This is a single instruction, so we need at least 2 instructions total (MOV_IMM, EXIT).
++	if numInsns >= 2 {
++		insnStartIndex := (numInsns - 2) * RAW_INSN_PER_LEN
++		code := result[insnStartIndex]
++		regs := result[insnStartIndex+1]
++
++		// fmt.Printf("Inspecting instruction at index %d: opcode=0x%x, regs=0x%x\n", insnStartIndex/RAW_INSN_PER_LEN, code, regs)
++
++		// Check if this is the BPF_MOV64_IMM(BPF_REG_0, IMM) instruction we are looking for.
++		if code == BPF_MOV64_IMM && regs == BPF_REG_0 {
++			imm := result[insnStartIndex+4]
++			// fmt.Printf("Found BPF_MOV64_IMM with R0 at instruction index %d, original IMM=0x%x. Modifying to 0x%x.\n", insnStartIndex/RAW_INSN_PER_LEN, imm, newImm)
++
++			if imm > 1 {
++				result[insnStartIndex+4] = newImm
++			}
++		}
++	}
++}
++
++func ParseBpfRawInsnString(data string) ([]uint64, error) {
++	// 1. Clean the string: remove curly braces {} and extra spaces.
++	cleanedData := strings.ReplaceAll(data, "{", "")
++	cleanedData = strings.ReplaceAll(cleanedData, "}", "")
++	cleanedData = strings.TrimSpace(cleanedData)
++
++	// 2. Split the string by commas to get string representations of each hex number.
++	hexStrings := strings.Split(cleanedData, ",")
++
++	// 3. Create a slice to store the converted uint64 values.
++	var result []uint64
++	result = make([]uint64, 0, len(hexStrings)) // Pre-allocating capacity can improve efficiency.
++
++	// 4. Iterate over the split strings and convert each hex string to a uint64.
++	for i, hexStr := range hexStrings {
++		// Trim whitespace from each hex string.
++		trimmedHexStr := strings.TrimSpace(hexStr)
++
++		// Skip empty strings (which can result from consecutive commas or leading/trailing commas).
++		if trimmedHexStr == "" {
++			continue
++		}
++
++		// Use strconv.ParseUint to convert the hex string to a uint64.
++		// Parameters:
++		// - trimmedHexStr: The string to convert.
++		// - 0: Auto-detect the base (supports "0x" prefix for hex).
++		// - 64: The target integer type is a 64-bit unsigned integer (uint64).
++		val, err := strconv.ParseUint(trimmedHexStr, 0, 64)
++		if err != nil {
++			// If conversion fails, return an error.
++			return nil, fmt.Errorf("failed to parse hex string '%s' at index %d: %w", trimmedHexStr, i, err)
++		}
++
++		// Append the converted uint64 value to the result slice.
++		result = append(result, val)
++	}
++
++	return result, nil
++}
++
++func ReadFileContent(filePath string) (string, error) {
++	content, err := os.ReadFile(filePath)
++	if err != nil {
++		return "", fmt.Errorf("error read file content %s: %w", filePath, err)
++	}
++	return string(content), nil
++}
++
++// extractBPFInsnFromContent scans the given string content and prints lines
++// that appear to be BPF instructions.
++func ExtractBPFInsnFromContent(content string) string {
++	// Use strings.Builder to efficiently build the final string
++	var builder strings.Builder
++
++	// The regular expression remains the same, and is used to find command lines starting with "BPF_"
++	bpfInstructionRegex := regexp.MustCompile(`^\s*BPF_`)
++
++	// Use scanner to read the content line by line
++	scanner := bufio.NewScanner(strings.NewReader(content))
++	for scanner.Scan() {
++		line := scanner.Text()
++		// Check if the current line matches a BPF instruction regular expression
++		if bpfInstructionRegex.MatchString(line) {
++			// If it matches, append the line and a newline to the builder
++			builder.WriteString(line)
++			builder.WriteString("\n")
++		}
++	}
++
++	// Returns the complete string constructed in builder
++	return builder.String()
++}
++
++func SelectRandomFileAndRead(targetDir string) (string, string, error) {
++	var files []string
++	err := filepath.WalkDir(targetDir, func(path string, d os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++		if !d.IsDir() && !strings.HasSuffix(strings.ToLower(path), ".json") {
++			files = append(files, path)
++		}
++		return nil
++	})
++	if err != nil {
++		return "", "", fmt.Errorf("遍历目录失败: %w", err)
++	}
++
++	if len(files) == 0 {
++		return "", "", fmt.Errorf("目标文件夹下没有符合条件的文件")
++	}
++
++	r := rand.New(rand.NewSource(time.Now().UnixNano()))
++	randomIndex := r.Intn(len(files))
++	selectedFile := files[randomIndex]
++
++	content, err := ReadFileContent(selectedFile)
++	bpfInsnContent := ExtractBPFInsnFromContent(content)
++	if err != nil {
++		return "", "", err
++	}
++
++	return selectedFile, bpfInsnContent, nil
++}
++
++type BpfProgTypeStruct struct {
++	Name     string
++	ProgType uint64 // enum BPF_PROG_TYPE_*
++}
++
++const (
++	BPF_F_STRICT_ALIGNMENT   = 1
++	BPF_F_ANY_ALIGNMENT      = 2
++	BPF_F_TEST_RND_HI32      = 4
++	BPF_F_TEST_STATE_FREQ    = 8
++	BPF_F_SLEEPABLE          = 16
++	BPF_F_XDP_HAS_FRAGS      = 32
++	BPF_F_XDP_DEV_BOUND_ONLY = 64
++)
++
++func selectProgLoadFlags(progType uint64) uint32 {
++	var flags uint32 = 0
++
++	if progType == BPF_PROG_TYPE_SYSCALL {
++		flags |= BPF_F_SLEEPABLE
++	}
++
++	if rand.Intn(100) < 20 {
++		flag_list := []uint32{BPF_F_STRICT_ALIGNMENT, BPF_F_ANY_ALIGNMENT, BPF_F_TEST_RND_HI32, BPF_F_TEST_STATE_FREQ, BPF_F_XDP_HAS_FRAGS, BPF_F_XDP_DEV_BOUND_ONLY}
++		times := rand.Intn(5) + 1
++		for i := 0; i < times; i++ {
++			flags |= flag_list[rand.Intn(len(flag_list))]
++		}
++	}
++
++	return flags
++
++}
++
++const (
++	BPF_PROG_TYPE_UNSPEC                  = 0
++	BPF_PROG_TYPE_SOCKET_FILTER           = 1
++	BPF_PROG_TYPE_KPROBE                  = 2
++	BPF_PROG_TYPE_SCHED_CLS               = 3
++	BPF_PROG_TYPE_SCHED_ACT               = 4
++	BPF_PROG_TYPE_TRACEPOINT              = 5
++	BPF_PROG_TYPE_XDP                     = 6
++	BPF_PROG_TYPE_PERF_EVENT              = 7
++	BPF_PROG_TYPE_CGROUP_SKB              = 8
++	BPF_PROG_TYPE_CGROUP_SOCK             = 9
++	BPF_PROG_TYPE_LWT_IN                  = 10
++	BPF_PROG_TYPE_LWT_OUT                 = 11
++	BPF_PROG_TYPE_LWT_XMIT                = 12
++	BPF_PROG_TYPE_SOCK_OPS                = 13
++	BPF_PROG_TYPE_SK_SKB                  = 14
++	BPF_PROG_TYPE_CGROUP_DEVICE           = 15
++	BPF_PROG_TYPE_SK_MSG                  = 16
++	BPF_PROG_TYPE_RAW_TRACEPOINT          = 17
++	BPF_PROG_TYPE_CGROUP_SOCK_ADDR        = 18
++	BPF_PROG_TYPE_LWT_SEG6LOCAL           = 19
++	BPF_PROG_TYPE_LIRC_MODE2              = 20
++	BPF_PROG_TYPE_SK_REUSEPORT            = 21
++	BPF_PROG_TYPE_FLOW_DISSECTOR          = 22
++	BPF_PROG_TYPE_CGROUP_SYSCTL           = 23
++	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE = 24
++	BPF_PROG_TYPE_CGROUP_SOCKOPT          = 25
++	BPF_PROG_TYPE_TRACING                 = 26
++	BPF_PROG_TYPE_STRUCT_OPS              = 27
++	BPF_PROG_TYPE_EXT                     = 28
++	BPF_PROG_TYPE_LSM                     = 29
++	BPF_PROG_TYPE_SK_LOOKUP               = 30
++	BPF_PROG_TYPE_SYSCALL                 = 31
++	BPF_PROG_TYPE_NETFILTER               = 32
++)
++
++var bpfProgTypeArray = []BpfProgTypeStruct{
++	{Name: "BPF_PROG_TYPE_UNSPEC", ProgType: BPF_PROG_TYPE_UNSPEC},
++	{Name: "BPF_PROG_TYPE_SOCKET_FILTER", ProgType: BPF_PROG_TYPE_SOCKET_FILTER},
++	{Name: "BPF_PROG_TYPE_KPROBE", ProgType: BPF_PROG_TYPE_KPROBE},
++	{Name: "BPF_PROG_TYPE_SCHED_CLS", ProgType: BPF_PROG_TYPE_SCHED_CLS},
++	{Name: "BPF_PROG_TYPE_SCHED_ACT", ProgType: BPF_PROG_TYPE_SCHED_ACT},
++	{Name: "BPF_PROG_TYPE_TRACEPOINT", ProgType: BPF_PROG_TYPE_TRACEPOINT},
++	{Name: "BPF_PROG_TYPE_XDP", ProgType: BPF_PROG_TYPE_XDP},
++	{Name: "BPF_PROG_TYPE_PERF_EVENT", ProgType: BPF_PROG_TYPE_PERF_EVENT},
++	{Name: "BPF_PROG_TYPE_CGROUP_SKB", ProgType: BPF_PROG_TYPE_CGROUP_SKB},
++	{Name: "BPF_PROG_TYPE_CGROUP_SOCK", ProgType: BPF_PROG_TYPE_CGROUP_SOCK},
++	{Name: "BPF_PROG_TYPE_LWT_IN", ProgType: BPF_PROG_TYPE_LWT_IN},
++	{Name: "BPF_PROG_TYPE_LWT_OUT", ProgType: BPF_PROG_TYPE_LWT_OUT},
++	{Name: "BPF_PROG_TYPE_LWT_XMIT", ProgType: BPF_PROG_TYPE_LWT_XMIT},
++	{Name: "BPF_PROG_TYPE_SOCK_OPS", ProgType: BPF_PROG_TYPE_SOCK_OPS},
++	{Name: "BPF_PROG_TYPE_SK_SKB", ProgType: BPF_PROG_TYPE_SK_SKB},
++	{Name: "BPF_PROG_TYPE_CGROUP_DEVICE", ProgType: BPF_PROG_TYPE_CGROUP_DEVICE},
++	{Name: "BPF_PROG_TYPE_SK_MSG", ProgType: BPF_PROG_TYPE_SK_MSG},
++	{Name: "BPF_PROG_TYPE_RAW_TRACEPOINT", ProgType: BPF_PROG_TYPE_RAW_TRACEPOINT},
++	{Name: "BPF_PROG_TYPE_CGROUP_SOCK_ADDR", ProgType: BPF_PROG_TYPE_CGROUP_SOCK_ADDR},
++	{Name: "BPF_PROG_TYPE_LWT_SEG6LOCAL", ProgType: BPF_PROG_TYPE_LWT_SEG6LOCAL},
++	{Name: "BPF_PROG_TYPE_LIRC_MODE2", ProgType: BPF_PROG_TYPE_LIRC_MODE2},
++	{Name: "BPF_PROG_TYPE_SK_REUSEPORT", ProgType: BPF_PROG_TYPE_SK_REUSEPORT},
++	{Name: "BPF_PROG_TYPE_FLOW_DISSECTOR", ProgType: BPF_PROG_TYPE_FLOW_DISSECTOR},
++	{Name: "BPF_PROG_TYPE_CGROUP_SYSCTL", ProgType: BPF_PROG_TYPE_CGROUP_SYSCTL},
++	{Name: "BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE", ProgType: BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE},
++	{Name: "BPF_PROG_TYPE_CGROUP_SOCKOPT", ProgType: BPF_PROG_TYPE_CGROUP_SOCKOPT},
++	{Name: "BPF_PROG_TYPE_TRACING", ProgType: BPF_PROG_TYPE_TRACING},
++	{Name: "BPF_PROG_TYPE_STRUCT_OPS", ProgType: BPF_PROG_TYPE_STRUCT_OPS},
++	{Name: "BPF_PROG_TYPE_EXT", ProgType: BPF_PROG_TYPE_EXT},
++	{Name: "BPF_PROG_TYPE_LSM", ProgType: BPF_PROG_TYPE_LSM},
++	{Name: "BPF_PROG_TYPE_SK_LOOKUP", ProgType: BPF_PROG_TYPE_SK_LOOKUP},
++	{Name: "BPF_PROG_TYPE_SYSCALL", ProgType: BPF_PROG_TYPE_SYSCALL},
++	{Name: "BPF_PROG_TYPE_NETFILTER", ProgType: BPF_PROG_TYPE_NETFILTER},
++}
++
++var bpfProgTypeMap map[string]BpfProgTypeStruct
++
++func initLdbfProgTypeMap() {
++	bpfProgTypeMap = make(map[string]BpfProgTypeStruct)
++	for _, def := range bpfProgTypeArray {
++		bpfProgTypeMap[def.Name] = def
++	}
++}
++
++// ExtractSupportedProgTypes extracts helper functions from the BPF IR content
++// and calculates the list of commonly supported prog_type based on dependencies.
++func ExtractSupportedProgTypes(bpfProg *BpfProg, jsonDependencies string) ([]string, error) {
++	// 1. Parse JSON dependencies.
++	var dependencies map[string][]string
++	if err := json.Unmarshal([]byte(jsonDependencies), &dependencies); err != nil {
++		return nil, fmt.Errorf("failed to parse dependency JSON file: %w", err)
++	}
++
++	// 2. Use regular expressions to extract all helper function names from the BPF IR.
++	//    This regex can match forms like BPF_RAW_INSN(...) and BPF_EMIT_CALL(...).
++	var helperRegex = regexp.MustCompile(`(?:BPF_RAW_INSN|BPF_EMIT_CALL)\((?:.*,\s*)?(\w+)\)`)
++	matches := helperRegex.FindAllStringSubmatch(bpfProg.BpfProgContent, -1)
++
++	foundHelpers := make(map[string]struct{}) // Use a set to remove duplicates.
++	for _, match := range matches {
++		if len(match) > 1 {
++			// Convert helper name to uppercase to match keys in the JSON.
++			foundHelpers[strings.ToUpper(match[1])] = struct{}{}
++		}
++	}
++
++	// fmt.Printf("\nExtracted helper functions from BPF IR: %v\n", foundHelpers)
++
++	// Convert the contents of dependencies to all uppercase
++	upperDependencies := make(map[string][]string)
++	for key, valueSlice := range dependencies {
++		upperKey := strings.ToUpper(key)
++		upperValueSlice := make([]string, len(valueSlice))
++		for i, value := range valueSlice {
++			upperValueSlice[i] = strings.ToUpper(value)
++		}
++		upperDependencies[upperKey] = upperValueSlice
++	}
++	dependencies = upperDependencies
++
++	// 3. Filter out helpers that have actual prog_type constraints in the JSON.
++	//    According to the rule, a helper with an empty prog_type list is considered a "wildcard"
++	//    and is ignored during intersection calculation.
++	var definedHelpers []string
++	for helper := range foundHelpers {
++		if progTypes, ok := dependencies[helper]; ok && len(progTypes) > 0 {
++			definedHelpers = append(definedHelpers, helper)
++		}
++		// fmt.Printf("Helper function used: %s, definedHelpers: %v, progTypes: %v\n\n", helper, definedHelpers, dependencies[helper])
++	}
++	// fmt.Printf("Defined helpers with constraints: %v, from program: %v\n", definedHelpers, bpfProg.BpfProgContent)
++
++	// 4. Calculate the final list of supported prog_types.
++	// Case A: If no helpers with actual constraints are found
++	// (possibly because there are no helpers in the IR, or all helpers are "wildcards").
++	if len(definedHelpers) == 0 {
++		// In this case, by default, all known prog_types are supported.
++		// We collect all prog_types that appear in the dependencies map.
++		allProgTypesSet := make(map[string]struct{})
++		for _, progTypes := range dependencies {
++			for _, pt := range progTypes {
++				allProgTypesSet[pt] = struct{}{}
++			}
++		}
++
++		result := make([]string, 0, len(allProgTypesSet))
++		for pt := range allProgTypesSet {
++			result = append(result, pt)
++		}
++		return result, nil
++	}
++
++	// Case B: Calculate the intersection of prog_types supported by all defined helpers.
++	// a. Initialize the intersection set with the list from the first helper.
++	initialProgTypes := dependencies[definedHelpers[0]]
++	intersectionSet := make(map[string]struct{})
++	for _, pt := range initialProgTypes {
++		intersectionSet[pt] = struct{}{}
++	}
++
++	// b. Iterate through the remaining helpers, narrowing down the intersection.
++	for i := 1; i < len(definedHelpers); i++ {
++		nextProgTypes := dependencies[definedHelpers[i]]
++
++		// Create a temporary set to store the new intersection for this iteration.
++		nextIntersectionSet := make(map[string]struct{})
++		for _, pt := range nextProgTypes {
++			// If the current prog_type also exists in the main intersection set, keep it.
++			if _, exists := intersectionSet[pt]; exists {
++				nextIntersectionSet[pt] = struct{}{}
++			}
++		}
++
++		// Update the main intersection set.
++		intersectionSet = nextIntersectionSet
++
++		// Optimization: if the intersection becomes empty midway, we can stop early.
++		if len(intersectionSet) == 0 {
++			break
++		}
++	}
++
++	// c. Convert the final intersection set back to a slice.
++	finalResult := make([]string, 0, len(intersectionSet))
++	for pt := range intersectionSet {
++		finalResult = append(finalResult, pt)
++	}
++
++	return finalResult, nil
++}
++
++// RandomSelectProgType calls the analysis function and randomly selects a prog type's numerical value from the result.
++func RandomSelectProgType(r *randGen, bpfProg *BpfProg) (uint64, error) {
++	// 1. Call the function to get the list of allowed prog_type names.
++	LDBFDir := os.Getenv("LDBF_DIR") + "/"
++	if LDBFDir == "/" {
++		panic("LDBF_DIR environment variable is not set")
++	}
++
++	helperProgTypeFile := LDBFDir + "dependency/func_prog.json"
++	dependenciesJSON, err := ReadFileContent(helperProgTypeFile)
++	if err != nil {
++		return 0, err
++	}
++
++	supportedProgTypes, err := ExtractSupportedProgTypes(bpfProg, dependenciesJSON)
++	if err != nil {
++		return 0, fmt.Errorf("error extracting supported prog types: %w", err)
++	}
++
++	// 2. Build the candidate pool using the efficient bpfProgTypeMap.
++	var candidates []BpfProgTypeStruct
++	if len(supportedProgTypes) > 0 {
++		candidates = make([]BpfProgTypeStruct, 0, len(supportedProgTypes))
++		// Iterate through the allowed names and perform a fast lookup in the map.
++		for _, name := range supportedProgTypes {
++			if progType, ok := bpfProgTypeMap[name]; ok {
++				candidates = append(candidates, progType)
++			}
++		}
++	}
++
++	// 3. If the candidate pool is empty (either initially or after filtering), use all types as a fallback.
++	if len(candidates) == 0 {
++		// fmt.Println("Warning: Candidate pool is empty, selecting randomly from all known prog_types.")
++		// Populate candidates from the map's values.
++		candidates = make([]BpfProgTypeStruct, 0, len(bpfProgTypeMap))
++		for _, progType := range bpfProgTypeMap {
++			candidates = append(candidates, progType)
++		}
++	}
++
++	// 4. Randomly select one from the final candidate pool.
++	randomIndex := r.Intn(len(candidates))
++	selectedProgType := candidates[randomIndex]
++
++	// 5. Return the ProgType numerical value of the selected struct.
++	return selectedProgType.ProgType, nil
++}
++
++func (r *randGen) patchBpfProgAttachTypesFields(c *Call, s *state, bpfProg *BpfProg) (changed bool) {
++	if r.patchConditionalDepth > 1 {
++		// Some nested patchConditionalFields() calls are fine as we could trigger a resource
++		// constructor via generateArg(). But since nested createResource() calls are prohibited,
++		// patchConditionalFields() should never be nested more than 2 times.
++		panic("third nested patchConditionalFields call")
++	}
++	r.patchConditionalDepth++
++	defer func() { r.patchConditionalDepth-- }()
++	var anyPatched bool
++	for {
++		replace := map[Arg]Arg{}
++		forEachStaleUnion(r.target, c,
++			func(unionArg *UnionArg, unionType *UnionType, okIndices []int) {
++				var idx int
++				var newTypeArg Arg
++				if unionType.String() == "bpf_prog_attach_types" {
++					idx = okIndices[0]
++				} else {
++					idx = okIndices[r.Intn(len(okIndices))]
++				}
++				newType, newDir := unionType.Fields[idx].Type,
++					unionType.Fields[idx].Dir(unionArg.Dir())
++				if unionType.String() == "bpf_prog_attach_types" {
++					newFlagsType := newType.(*FlagsType)
++					newFlagsTypeLen := len(newFlagsType.Vals)
++					RandomSelectFlagsTypeIndex := r.Intn(newFlagsTypeLen)
++					expectedAttachType := newFlagsType.Vals[RandomSelectFlagsTypeIndex]
++					newTypeArg = MakeConstArg(newFlagsType, newDir, expectedAttachType)
++					bpfProg.BpfProgContext.ExpectedAttachType = expectedAttachType
++					// fmt.Printf("Patch %s, prog_type=%d, expected_attach_type=%d, index:%d, from %v\n", newType.String(), bpfProg.BpfProgContext.ProgType, newTypeArg.(*ConstArg).Val, RandomSelectFlagsTypeIndex, newFlagsType.Vals)
++				} else {
++					newTypeArg, _ = r.generateArg(s, newType, newDir)
++				}
++				replace[unionArg] = MakeUnionArg(unionType, newDir, newTypeArg, idx)
++				anyPatched = true
++			})
++		for old, new := range replace {
++			replaceArg(old, new)
++		}
++		// The newly inserted argument might contain more arguments we need
++		// to patch.
++		// Repeat until we have to change nothing.
++		if len(replace) == 0 {
++			break
++		}
++	}
++	return anyPatched
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfProgLoadCall(r *randGen, s *state, bpfProg *BpfProg) (calls []*Call) {
++	meta := r.target.SyscallMap["bpf$LDBF_PROG_LOAD"]
++	// args := make([]Arg, len(meta.Args))
++
++	c := MakeCall(meta, nil)
++	c.Args, _ = r.generateArgs(s, meta.Args, DirIn)
++
++	BpfInsnByteCodeArray, err := ParseBpfRawInsnString(bpfProg.BpfRawInsnString)
++	if err != nil {
++		// fmt.Println("Error parsing data:", err)
++		return nil
++	}
++
++	BpfInsnByteCodeArray = ParseRawInsnAssignArgs(r, BpfInsnByteCodeArray)
++	ParseRawInsnReturnCode(r, BpfInsnByteCodeArray)
++
++	// Declare variables that will be used after goto
++	var ok bool
++	var cArgfield *PtrType
++	var bpfProgType *StructType
++	var cargfieldArg *PointerArg
++	var bpfProgTypeArg *GroupArg
++	var bpfProgTypeDir Dir
++	var selectProgTypeValue uint64
++	var bpfProgTypeIdx int
++	var bpfProgTypeFlag *FlagsType
++	var bpfProgTypeFlagArg Arg
++	var bpfInstructionsPtr *PtrType
++	var bpfInsnArrayArg Arg
++	var bpfInstructionsArg Arg
++	var bpfInstPtrArg Arg
++	var bpfInsnArray *ArrayType
++	var bpfInstructions *UnionType
++	var bpfProgTypeField Field
++	var bpfInsnIndex int
++	var bpfInstructionsPtrIdx int
++	var bpfInsnGenericInner []Arg
++
++	cArgfield, ok = c.Args[1].Type().(*PtrType)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a pointer type, got %T\n", c.Args[1].Type())
++		goto finish_gen
++	}
++
++	bpfProgType, ok = cArgfield.Elem.(*StructType)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: cArgfield.Elem is not a struct type, got %T\n", cArgfield.Elem)
++		goto finish_gen
++	}
++
++	cargfieldArg, ok = c.Args[1].(*PointerArg)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfMapCreateCall: c.Args[1] is not a PointerArg type, got %T\n", c.Args[1])
++		goto finish_gen
++	}
++	bpfProgTypeArg, ok = cargfieldArg.Res.(*GroupArg)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfProgLoadCall: cargfieldArg.Res is not a GroupArg type, got %T\n", cargfieldArg.Res)
++		goto finish_gen
++	}
++	bpfProgTypeDir = cArgfield.ElemDir
++
++	selectProgTypeValue, _ = RandomSelectProgType(r, bpfProg)
++	bpfProgTypeIdx = 0
++	bpfProgTypeFlag, ok = bpfProgType.Fields[bpfProgTypeIdx].Type.(*FlagsType)
++	if !ok {
++		// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfProgType.Fields[%d] is not a flags type, got %T\n", bpfProgTypeIdx, bpfProgType.Fields[bpfProgTypeIdx].Type)
++		goto finish_gen
++	}
++	bpfProgTypeFlagArg = MakeConstArg(bpfProgTypeFlag, cArgfield.ElemDir, selectProgTypeValue)
++
++	for idx, field := range bpfProgType.Fields {
++		if field.String() != "ptr[in, bpf_instructions]" {
++			continue
++		}
++		bpfInstructionsPtrIdx = idx
++		bpfProgTypeField = field
++
++		bpfInstructionsPtr, ok = bpfProgTypeField.Type.(*PtrType)
++		if !ok {
++			// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfProgTypeField.Type is not a pointer type, got %T\n", bpfProgTypeField.Type)
++			goto finish_gen
++		}
++
++		bpfInstructions, ok = bpfInstructionsPtr.Elem.(*UnionType)
++		bpfInstructionsDir := bpfInstructionsPtr.ElemDir
++		if !ok {
++			// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfInstructionsPtr.Elem is not a union type, got %T\n", bpfInstructionsPtr.Elem)
++			goto finish_gen
++		}
++
++		bpfInsnIndex = 0
++		bpfinsnType := bpfInstructions.Fields[bpfInsnIndex].Type
++		bpfinsnDir := bpfInstructionsDir
++
++		bpfInsnArray, ok = bpfinsnType.(*ArrayType)
++		if !ok {
++			// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfInstructions.Fields[%d].Type is not an array type, got %T\n", bpfInsnIndex, bpfinsnType)
++			goto finish_gen
++		}
++
++		bpfInsn, ok := bpfInsnArray.Elem.(*UnionType)
++		if !ok {
++			// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfInsnArray.Elem is not a union type, got %T\n", bpfInsnArray.Elem)
++			goto finish_gen
++		}
++
++		// var count uint64 = 8
++		valueCount := 0
++		bpfInsnGenericInner = nil
++
++		bpfInsnGenericIndex := 0
++		bpfInsnGenericDir := bpfInsn.Fields[bpfInsnGenericIndex].Dir(bpfinsnDir)
++		bpfInsnGenericType := bpfInsn.Fields[bpfInsnGenericIndex].Type
++		bpfInsnGeneric, ok := bpfInsnGenericType.(*StructType)
++		if !ok {
++			// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfInsn.Fields[%d].Type is not a struct type, got %T\n", bpfInsnGenericIndex, bpfInsnGenericType)
++			goto finish_gen
++		}
++
++		bpfInsnMapFdIndex := 9
++		bpfInsnMapFdDir := bpfInsn.Fields[bpfInsnMapFdIndex].Dir(bpfinsnDir)
++		bpfInsnMapFdType := bpfInsn.Fields[bpfInsnMapFdIndex].Type
++		bpfInsnMapFd, ok := bpfInsnMapFdType.(*StructType)
++		if !ok {
++			// fmt.Printf("Ldbf: genLdbfProgLoadCall: bpfInsn.Fields[%d].Type is not a struct type, got %T\n", bpfInsnMapFdIndex, bpfInsnMapFdType)
++			goto finish_gen
++		}
++
++		for insnIndex := int(0); valueCount < len(BpfInsnByteCodeArray); insnIndex++ {
++			// handle BPF_LOAD_MAP_FD instruction
++			if _, ok := bpfProg.BpfMapResMap[insnIndex]; ok {
++				// fmt.Printf("Ldbf: genLdbfProgLoadCall: found BPF_LOAD_MAP_FD Insn, index %d\n", insnIndex)
++
++				bpfInsnMapFdArgs := make([]Arg, len(bpfInsnMapFd.Fields))
++				for bpfInsnMapFdFieldIdx, bpfInsnMapFdField := range bpfInsnMapFd.Fields {
++					if bpfInsnMapFdFieldInt, ok := bpfInsnMapFdField.Type.(*ConstType); ok {
++						bpfInsnMapFdArgs[bpfInsnMapFdFieldIdx] = MakeConstArg(bpfInsnMapFdFieldInt, bpfInsnMapFdDir, BpfInsnByteCodeArray[valueCount])
++					} else if bpfInsnMapFdFieldFlags, ok := bpfInsnMapFdField.Type.(*FlagsType); ok {
++						bpfInsnMapFdArgs[bpfInsnMapFdFieldIdx] = MakeConstArg(bpfInsnMapFdFieldFlags, bpfInsnMapFdDir, BpfInsnByteCodeArray[valueCount])
++					} else if bpfInsnMapFdFieldRes, ok := bpfInsnMapFdField.Type.(*ResourceType); ok {
++						bpfInsnMapFdArgs[bpfInsnMapFdFieldIdx] = MakeResultArg(bpfInsnMapFdFieldRes, bpfInsnMapFdDir, bpfProg.BpfMapResMap[insnIndex], 0)
++					}
++					valueCount++
++				}
++				valueCount++
++
++				bpfInsnMapFdGroup := MakeGroupArg(bpfInsnMapFd, bpfInsnMapFdDir, bpfInsnMapFdArgs)
++				bpfInsnArrayArg = MakeUnionArg(bpfInsn, bpfProgTypeField.Dir(DirIn), bpfInsnMapFdGroup, bpfInsnMapFdIndex)
++				bpfInsnGenericInner = append(bpfInsnGenericInner, bpfInsnArrayArg)
++			} else { // handle BPF_GENERIC_INSN instruction
++				bpfInsnGenericArgs := make([]Arg, len(bpfInsnGeneric.Fields))
++
++				for bpfInsnGenericFieldIdx, bpfInsnGenericField := range bpfInsnGeneric.Fields {
++					if bpfInsnGenericFieldInt, ok := bpfInsnGenericField.Type.(*IntType); ok {
++						if valueCount >= len(BpfInsnByteCodeArray) {
++							break
++						}
++						bpfInsnGenericArgs[bpfInsnGenericFieldIdx] = MakeConstArg(bpfInsnGenericFieldInt, bpfInsnGenericDir, BpfInsnByteCodeArray[valueCount])
++						valueCount++
++					}
++				}
++				bpfInsnGenericGroup := MakeGroupArg(bpfInsnGeneric, bpfInsnGenericDir, bpfInsnGenericArgs)
++				bpfInsnArrayArg = MakeUnionArg(bpfInsn, bpfProgTypeField.Dir(DirIn), bpfInsnGenericGroup, bpfInsnGenericIndex)
++				bpfInsnGenericInner = append(bpfInsnGenericInner, bpfInsnArrayArg)
++			}
++		}
++		break
++	}
++
++	if bpfInsnArray != nil && bpfInstructions != nil {
++		bpfInsnArrayArg = MakeGroupArg(bpfInsnArray, bpfProgTypeField.Dir(DirIn), bpfInsnGenericInner)
++		bpfInstructionsArg = MakeUnionArg(bpfInstructions, bpfProgTypeField.Dir(DirIn), bpfInsnArrayArg, bpfInsnIndex)
++		bpfInstPtrArg = r.allocAddr(s, bpfInstructionsPtr, bpfProgTypeField.Dir(DirIn), bpfInstructionsArg.Size(), bpfInstructionsArg)
++		fmt.Printf("Ldbf: GenLdbfPrologue: BpfProgFilePath: %s, old bpfProgType is %v, selectProgTypeValue is %v\n\n",
++			bpfProg.BpfProgFilePath, bpfProgTypeArg.Inner[bpfProgTypeIdx].(*ConstArg).Val, selectProgTypeValue)
++		replaceArg(bpfProgTypeArg.Inner[bpfProgTypeIdx], bpfProgTypeFlagArg)
++		replaceArg(bpfProgTypeArg.Inner[bpfInstructionsPtrIdx], bpfInstPtrArg)
++	}
++
++	bpfProg.BpfProgContext.ProgType = selectProgTypeValue
++
++	for bpfProgTypeIdx, bpfProgTypeField := range bpfProgType.Fields {
++		if bpfProgTypeIdx < 2 {
++			continue
++		}
++		var newArg Arg
++		bpfProgTypeFieldDir := bpfProgTypeField.Dir(bpfProgTypeDir)
++		switch bpfProgTypeIdx {
++		case 3: // license
++			licensePtrElemDir := bpfProgTypeField.Type.(*PtrType).ElemDir
++			licensePtrElem := bpfProgTypeField.Type.(*PtrType).Elem.(*BufferType)
++			inner := MakeDataArg(licensePtrElem, licensePtrElemDir, append([]byte("GPL"), 0))
++			newArg = r.allocAddr(s, bpfProgTypeField.Type, bpfProgTypeFieldDir, inner.Size(), inner)
++
++		case 4: // loglev, log_size, [0, 15]
++			newArg = MakeConstArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, 0)
++		// case 5, 15, 18, 21: // LenType, just skip
++		case 6, 14, 17, 22, 23: // PtrType; func_info, func_info_cnt，line_info, line_info_cnt should be set to 0
++			newArg = MakeSpecialPointerArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, 0)
++
++		case 7, 13, 16, 24, 25: // IntType, FlagsType, ConstType, ProcType, CsumType
++			newArg = MakeConstArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, 0)
++
++		case 8: // flags
++			newArg = MakeConstArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, uint64(selectProgLoadFlags(selectProgTypeValue)))
++			//newArg = MakeConstArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, 0)
++		case 9: // BufferType
++			//newArg = MakeDataArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, nil)
++
++		case 10, 12, 20: // ResourceType
++			newArg = MakeResultArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, nil, 0)
++
++		case 19: // attach_btf_id
++			attach_btf_id := uint64(0)
++			if selectProgTypeValue == BPF_PROG_TYPE_LSM ||
++				selectProgTypeValue == BPF_PROG_TYPE_TRACING ||
++				selectProgTypeValue == BPF_PROG_TYPE_EXT {
++				attach_btf_id = uint64(getRandomBtfid())
++				// linux 6.6 bpf_lsm_file_mprotect 227982
++			}
++			newArg = MakeResultArg(bpfProgTypeField.Type, bpfProgTypeFieldDir, nil, attach_btf_id)
++			// case 11, 26, 27: // UnionType, todo
++		}
++		if newArg != nil {
++			replaceArg(bpfProgTypeArg.Inner[bpfProgTypeIdx], newArg)
++		}
++	}
++
++finish_gen:
++	r.patchBpfProgAttachTypesFields(c, s, bpfProg)
++	r.target.assignSizesCall(c)
++	var currentBpfMapCall []*Call
++	return append(currentBpfMapCall, c)
++}
+diff --git a/prog/ldbf_run.go b/prog/ldbf_run.go
+new file mode 100644
+index 000000000..5feca9431
+--- /dev/null
++++ b/prog/ldbf_run.go
+@@ -0,0 +1,1026 @@
++package prog
++
++import (
++	"encoding/binary"
++	"unsafe"
++)
++
++type BpfProgTestRunStruct struct {
++	ProgFD      *ResultArg
++	DataSizeIn  uint32 /* input: len of ctx_in */
++	DataSizeOut uint32 /* input/output: len of ctx_out returns ENOSPC if ctx_out is too small.*/
++	DataIn      []byte
++	DataOut     []byte
++	Repeat      uint32 // number of times to run the program
++	Duration    uint32 // returns the duration of the last run in nanoseconds
++	CtxSizeIn   uint32 /* input: len of ctx_in */
++	CtxSizeOut  uint32 /* input/output: len of ctx_out returns ENOSPC if ctx_out is too small.*/
++	CtxIn       []byte
++	CtxOut      []byte
++	Flags       uint32 // flags for the test run
++	Cpu         uint32 // CPU to run the program on
++	BatchSize   uint32 // batch size for the test run
++}
++
++type SkBuff struct {
++	Len            uint32
++	PktType        uint32
++	Mark           uint32
++	QueueMapping   uint32
++	Protocol       uint32
++	VlanPresent    uint32
++	VlanTci        uint32
++	VlanProto      uint32
++	Priority       uint32
++	IngressIfindex uint32
++	Ifindex        uint32
++	TcIndex        uint32
++	Cb             [5]uint32
++	Hash           uint32
++	TcClassid      uint32
++	Data           uint32
++	DataEnd        uint32
++	NapiId         uint32
++	Family         uint32
++	RemoteIp4      uint32    // Stored in network byte order
++	LocalIp4       uint32    // Stored in network byte order
++	RemoteIp6      [4]uint32 // Stored in network byte order
++	LocalIp6       [4]uint32 // Stored in network byte order
++	RemotePort     uint32    // Stored in network byte order
++	LocalPort      uint32    // Stored in host byte order
++	DataMeta       uint32
++	FlowKeys       uint64 // Represents __bpf_md_ptr(struct bpf_flow_keys *, flow_keys)
++	Tstamp         uint64
++	WireLen        uint32
++	GsoSegs        uint32
++	Sk             uint64 // Represents __bpf_md_ptr(struct bpf_sock *, sk)
++	GsoSize        uint32
++	TstampType     uint8
++	Padding        [3]byte // Padding, future use
++	Hwtstamp       uint64
++}
++
++const (
++	// Minimum value of data_size_in
++	ETH_HLEN = 14
++
++	// MAX_Data_SIZE_IN is a safe upper bound for data_size_in.
++	// The kernel checks `size > 4096 - headroom - tailroom`.
++	MAX_Data_SIZE_IN = 4096
++
++	// Ethernet header align len.
++	ETH_ALEN = 6
++
++	// Internet Protocol packet.
++	ETH_P_IP = 0x0800
++	// IPv6 over bluebook.
++	ETH_P_IPV6 = 0x86DD
++
++	// Maximum interface index.
++	MAX_IF_INDEX = 32
++
++	// Repeat times
++	REPEAT_TIMES = 10
++
++	// BPF_F_TEST_XDP_LIVE_FRAMES is the flag for do_live mode.
++	BPF_F_TEST_XDP_LIVE_FRAMES = 1
++
++	// TEST_XDP_MAX_BATCH defines the maximum batch size for live mode.
++	TEST_XDP_MAX_BATCH = 256
++
++	// Maximum cpus.
++	MAX_CPUS = 4
++
++	// BPF_F_TEST_RUN_ON_CPU is the flag to run the test on a specific CPU.
++	BPF_F_TEST_RUN_ON_CPU = 1
++
++	// MAX_BPF_FUNC_ARGS defines the maximum number of arguments for a BPF raw tracepoint.
++	MAX_BPF_FUNC_ARGS = 12
++
++	// Address families.
++	AF_INET  = 2
++	AF_INET6 = 10
++
++	// Maximum values for port.
++	U16_MAX = 65535
++
++	// Maximum protocol number.
++	IPPROTO_MAX = 263
++
++	// netfilter protocol families.
++	NFPROTO_IPV4 = 2
++	NFPROTO_IPV6 = 10
++
++	// netfilter hook points.
++	NF_INET_PRE_ROUTING  = 0
++	NF_INET_LOCAL_IN     = 1
++	NF_INET_FORWARD      = 2
++	NF_INET_LOCAL_OUT    = 3
++	NF_INET_POST_ROUTING = 4
++	NF_INET_NUMHOOKS     = 5
++	NF_INET_INGRESS      = NF_INET_NUMHOOKS
++
++	// Sizes of IP headers.
++	SIZE_OF_IPHDR   = 20
++	SIZE_OF_IPV6HDR = 40
++
++	// Ratio of forging a valid packet data
++	PACKET_FORGE_RATE = 0.8
++)
++
++// NewValidSkBuffForTestRun creates a byte representation of a SkBuff struct,
++// constructed to pass the checks in the kernel's convert___skb_to_skb function.
++// It randomizes allowed fields and returns a safe, independent byte slice.
++func NewValidSkBuffForTestRun(r *randGen) []byte {
++	// 1. Create a pointer to a SkBuff struct. Go initializes all fields to zero.
++	skb := &SkBuff{}
++
++	// 2. Randomize only the fields that are explicitly allowed to be non-zero.
++	skb.Mark = r.Uint32()
++	skb.Priority = r.Uint32()
++	skb.IngressIfindex = r.Uint32()
++	skb.Ifindex = uint32(r.Intn(MAX_IF_INDEX))
++	for i := range skb.Cb {
++		skb.Cb[i] = r.Uint32()
++	}
++	skb.Tstamp = r.Uint64()
++	// wire_len is kept at 0 to safely pass kernel checks.
++	skb.WireLen = 0
++	// gso_segs is randomized to a small value to avoid exceeding kernel limits.
++	skb.GsoSegs = uint32(r.Intn(65536))
++	skb.GsoSize = r.Uint32()
++	skb.Hwtstamp = r.Uint64()
++
++	// 3. Get the total size of the struct in memory.
++	size := unsafe.Sizeof(*skb)
++
++	// 4. Create a new, independent byte slice of the exact same size.
++	// This is the safe `make` allocation.
++	data := make([]byte, size)
++
++	// 5. Create a temporary unsafe view of the struct's memory.
++	skbBytesView := (*[1 << 30]byte)(unsafe.Pointer(skb))[:size:size]
++
++	// 6. Copy the content from the struct's memory view into the new slice.
++	copy(data, skbBytesView)
++
++	// 7. Return the new, safe, and independent data slice.
++	return data
++}
++
++type EthHdr struct {
++	HDest   [ETH_ALEN]byte
++	HSource [ETH_ALEN]byte
++	HProto  uint16 // Stored in network byte order (Big Endian)
++}
++
++type IpHdr struct {
++	VersionIHL uint8 // 4 bits for Version, 4 bits for IHL
++	Tos        uint8
++	TotLen     uint16 // Stored in network byte order (Big Endian)
++	Id         uint16 // Stored in network byte order (Big Endian)
++	FragOff    uint16 // Stored in network byte order (Big Endian)
++	TTL        uint8
++	Protocol   uint8
++	Check      uint16 // Stored in network byte order (Big Endian)
++	Saddr      uint32 // Stored in network byte order (Big Endian)
++	Daddr      uint32 // Stored in network byte order (Big Endian)
++}
++
++type Ipv6Hdr struct {
++	VersionPriority uint8 // 4 bits version, 4 bits priority
++	FlowLabel       [3]byte
++	PayloadLen      uint16
++	NextHdr         uint8
++	HopLimit        uint8
++	Saddr           [16]byte
++	Daddr           [16]byte
++}
++
++// NewValidSkBuffPacketData constructs a structured, valid network packet as a byte slice
++func NewValidSkBuffPacketData(r *randGen) []byte {
++	// 1. Populate the common Ethernet header struct.
++	eth := &EthHdr{}
++	// Populate the struct fields with valid and random data.
++	// Populate Ethernet Header
++	for i := range eth.HDest {
++		eth.HDest[i] = byte(r.Intn(256))
++	}
++	for i := range eth.HSource {
++		eth.HSource[i] = byte(r.Intn(256))
++	}
++
++	var dataIn []byte
++	var dataSizeIn int
++
++	// 2. Randomly choose to create either an IPv4 or IPv6 packet.
++	if r.bin() {
++		// --- Generate IPv4 Packet ---
++		eth.HProto = ETH_P_IP
++
++		minSize := ETH_HLEN + SIZE_OF_IPHDR
++		dataSizeIn = minSize + r.Intn(MAX_Data_SIZE_IN)
++		dataIn = make([]byte, dataSizeIn)
++
++		ip := &IpHdr{
++			VersionIHL: (4 << 4) | uint8(r.Intn(16)), // Version 4, Header Length 5 (20 bytes)
++			Tos:        uint8(r.Intn(256)),
++			TotLen:     uint16(dataSizeIn - ETH_HLEN),
++			Id:         uint16(r.Intn(65536)),
++			FragOff:    uint16(r.Intn(65536)),
++			TTL:        uint8(r.Intn(256)),
++			Protocol:   uint8(r.Intn(256)),
++			Check:      uint16(r.Intn(65536)),
++			Saddr:      r.Uint32(),
++			Daddr:      r.Uint32(),
++		}
++
++		// Serialize Ethernet and IPv4 headers
++		copy(dataIn[int(unsafe.Offsetof(eth.HDest)):], eth.HDest[:])
++		copy(dataIn[int(unsafe.Offsetof(eth.HSource)):], eth.HSource[:])
++		binary.BigEndian.PutUint16(dataIn[int(unsafe.Offsetof(eth.HProto)):], eth.HProto)
++
++		ipOffset := ETH_HLEN
++		dataIn[ipOffset+int(unsafe.Offsetof(ip.VersionIHL))] = ip.VersionIHL
++		dataIn[ipOffset+int(unsafe.Offsetof(ip.Tos))] = ip.Tos
++		binary.BigEndian.PutUint16(dataIn[ipOffset+int(unsafe.Offsetof(ip.TotLen)):], ip.TotLen)
++		binary.BigEndian.PutUint16(dataIn[ipOffset+int(unsafe.Offsetof(ip.Id)):], ip.Id)
++		binary.BigEndian.PutUint16(dataIn[ipOffset+int(unsafe.Offsetof(ip.FragOff)):], ip.FragOff)
++		dataIn[ipOffset+int(unsafe.Offsetof(ip.TTL))] = ip.TTL
++		dataIn[ipOffset+int(unsafe.Offsetof(ip.Protocol))] = ip.Protocol
++		binary.BigEndian.PutUint16(dataIn[ipOffset+int(unsafe.Offsetof(ip.Check)):], ip.Check)
++		binary.BigEndian.PutUint32(dataIn[ipOffset+int(unsafe.Offsetof(ip.Saddr)):], ip.Saddr)
++		binary.BigEndian.PutUint32(dataIn[ipOffset+int(unsafe.Offsetof(ip.Daddr)):], ip.Daddr)
++
++		// Fill payload with random data
++		for i := int(ETH_HLEN + SIZE_OF_IPHDR); i < dataSizeIn; i++ {
++			dataIn[i] = byte(r.Intn(256))
++		}
++
++	} else {
++		// --- Generate IPv6 Packet ---
++		eth.HProto = ETH_P_IPV6
++
++		minSize := ETH_HLEN + SIZE_OF_IPV6HDR
++		dataSizeIn = minSize + r.Intn(MAX_Data_SIZE_IN)
++		dataIn = make([]byte, dataSizeIn)
++
++		ipv6 := &Ipv6Hdr{
++			VersionPriority: (6 << 4) | uint8(r.Intn(16)), // Version 6, Priority 0
++			PayloadLen:      uint16(dataSizeIn - ETH_HLEN - SIZE_OF_IPV6HDR),
++			NextHdr:         uint8(r.Intn(256)),
++			HopLimit:        uint8(r.Intn(256)),
++		}
++		for i := range ipv6.FlowLabel {
++			ipv6.FlowLabel[i] = byte(r.Intn(256))
++		}
++		for i := range ipv6.Saddr {
++			ipv6.Saddr[i] = byte(r.Intn(256))
++		}
++		for i := range ipv6.Daddr {
++			ipv6.Daddr[i] = byte(r.Intn(256))
++		}
++
++		// Serialize Ethernet and IPv6 headers
++		copy(dataIn[int(unsafe.Offsetof(eth.HDest)):], eth.HDest[:])
++		copy(dataIn[int(unsafe.Offsetof(eth.HSource)):], eth.HSource[:])
++		binary.BigEndian.PutUint16(dataIn[int(unsafe.Offsetof(eth.HProto)):], eth.HProto)
++
++		ipOffset := ETH_HLEN
++		dataIn[ipOffset+int(unsafe.Offsetof(ipv6.VersionPriority))] = ipv6.VersionPriority
++		copy(dataIn[ipOffset+int(unsafe.Offsetof(ipv6.FlowLabel)):], ipv6.FlowLabel[:])
++		binary.BigEndian.PutUint16(dataIn[ipOffset+int(unsafe.Offsetof(ipv6.PayloadLen)):], ipv6.PayloadLen)
++		dataIn[ipOffset+int(unsafe.Offsetof(ipv6.NextHdr))] = ipv6.NextHdr
++		dataIn[ipOffset+int(unsafe.Offsetof(ipv6.HopLimit))] = ipv6.HopLimit
++		copy(dataIn[ipOffset+int(unsafe.Offsetof(ipv6.Saddr)):], ipv6.Saddr[:])
++		copy(dataIn[ipOffset+int(unsafe.Offsetof(ipv6.Daddr)):], ipv6.Daddr[:])
++
++		// Fill payload with random data
++		for i := int(ETH_HLEN + SIZE_OF_IPV6HDR); i < dataSizeIn; i++ {
++			dataIn[i] = byte(r.Intn(256))
++		}
++	}
++
++	return dataIn
++}
++
++// PatchBpfProgTestRunSkb constructs valid parameters for bpf_prog_test_run_skb
++// command targeting a BPF program that expects a __sk_buff context.
++func PatchBpfProgTestRunSkb(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	var dataSizeIn int
++	var dataIn []byte
++
++	if r.Float64() > PACKET_FORGE_RATE {
++		// Create random input data.
++		dataSizeIn = ETH_HLEN + r.Intn(MAX_Data_SIZE_IN)
++		dataIn = make([]byte, dataSizeIn)
++		for i := range dataIn {
++			dataIn[i] = byte(r.Intn(256))
++		}
++	} else {
++		// Create structured, valid packet data.
++		dataIn = NewValidSkBuffPacketData(r)
++		dataSizeIn = len(dataIn)
++	}
++	// fmt.Printf("BpfProgFilePath:%s, skb packet data of size %d bytes:\n", bpfProg.BpfProgFilePath, dataSizeIn)
++
++	// ctx_in point to a valid struct __sk_buff
++	// make sure the fields don't use are zeroed
++	ctxIn := NewValidSkBuffForTestRun(r)
++	ctxSizeIn := len(ctxIn)
++	dataOut := make([]byte, dataSizeIn)
++
++	return BpfProgTestRunStruct{
++		// ProgFD: The file descriptor of the BPF program to test.
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  uint32(dataSizeIn),
++		DataSizeOut: uint32(len(dataOut)),
++		DataIn:      dataIn,
++		DataOut:     dataOut,
++
++		Repeat:   uint32(r.Intn(REPEAT_TIMES)),
++		Duration: r.Uint32(),
++
++		CtxSizeIn:  uint32(ctxSizeIn),       // Size of the input context data.
++		CtxSizeOut: uint32(ctxSizeIn),       // Size of the output context data.
++		CtxIn:      ctxIn,                   // struct __sk_buff, input context data
++		CtxOut:     make([]byte, ctxSizeIn), // Allocate space for the output context data.
++
++		// Flags, Cpu, BatchSize: These MUST be zero for skb-based test runs,
++		// as checked by bpf_prog_test_run_skb in the kernel.
++		Flags:     0,
++		Cpu:       0,
++		BatchSize: 0,
++	}
++}
++
++// XdpMd mirrors the kernel's `struct xdp_md`, which is the context
++// passed to XDP BPF programs.
++type XdpMd struct {
++	Data           uint32
++	DataEnd        uint32
++	DataMeta       uint32
++	IngressIfindex uint32
++	RxQueueIndex   uint32
++	EgressIfindex  uint32
++}
++
++// NewValidXdpMdForTestRun creates a byte representation of an XdpMd struct,
++// constructed to pass the checks in the kernel's bpf_prog_test_run_xdp function.
++// The `dataSize` parameter is crucial as `xdp_md.data_end` must match the
++// size of the packet data buffer used in the test.
++func NewValidXdpMdForTestRun(r *randGen, dataSize uint64) []byte {
++	// 1. Create a pointer to an XdpMd struct.
++	xdp := &XdpMd{
++		// 2. Set fields according to kernel validation rules.
++		// data and data_end define the packet boundaries. For a simple test,
++		// we set data to 0 (start of packet) and data_end to the packet's size.
++		Data:    uint32(r.Intn(int(dataSize))),
++		DataEnd: uint32(dataSize),
++
++		// data_meta must be zero.
++		DataMeta: 0,
++
++		// These are metadata fields that can be randomized for more robust testing.
++		IngressIfindex: uint32(r.Intn(16) + 1),
++		RxQueueIndex:   uint32(r.Intn(8)),
++		EgressIfindex:  0,
++	}
++
++	// 3. Get the total size of the struct in memory.
++	size := unsafe.Sizeof(*xdp)
++
++	// 4. Create a new, independent byte slice of the exact same size.
++	data := make([]byte, size)
++
++	// 5. Create a temporary unsafe view of the struct's memory.
++	xdpBytesView := (*[1 << 30]byte)(unsafe.Pointer(xdp))[:size:size]
++
++	// 6. Copy the content from the struct's memory view into the new slice.
++	copy(data, xdpBytesView)
++
++	// 7. Return the new, safe, and independent data slice.
++	return data
++}
++
++// PatchBpfProgTestRunXDP constructs valid parameters for the bpf_prog_test_run
++// command targeting a BPF program that expects an `xdp_md` context.
++func PatchBpfProgTestRunXDP(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	var flags uint32
++	var batchSize uint32
++	var ctxOut []byte
++	var ctxSizeOut uint32
++	var dataOut []byte
++
++	dataSizeIn := ETH_HLEN + r.Intn(MAX_Data_SIZE_IN*2)
++
++	// Create the input context first.
++	ctxIn := NewValidXdpMdForTestRun(r, uint64(dataSizeIn))
++
++	// Create random input data.
++	dataIn := make([]byte, dataSizeIn)
++	for i := range dataIn {
++		dataIn[i] = byte(r.Intn(256))
++	}
++
++	// Decide if we should attempt a "live frames" test run (do_live=true).
++	// This is only valid if the input data size is not too large and if
++	// output buffers (`ctx_out`, `data_out`) are NULL.
++	isLiveModePossible := dataSizeIn <= MAX_Data_SIZE_IN
++	useLiveMode := isLiveModePossible && (r.Intn(2) == 0)
++
++	if useLiveMode {
++		// Live frames test run (do_live = true).
++		flags = BPF_F_TEST_XDP_LIVE_FRAMES
++		batchSize = uint32(r.Intn(TEST_XDP_MAX_BATCH)) // Random value 0-255
++		// In this mode, `ctx_out` and `data_out` must be NULL.
++		ctxOut = nil
++		ctxSizeOut = 0
++		dataOut = nil
++	} else {
++		// Standard test run (do_live = false).
++		flags = 0
++		// In this mode, batch_size MUST be 0.
++		batchSize = 0
++		// We can provide an output context buffer.
++		ctxOut = make([]byte, len(ctxIn))
++		ctxSizeOut = uint32(len(ctxOut))
++		// We can provide an output data buffer.
++		dataOut = make([]byte, dataSizeIn)
++	}
++
++	return BpfProgTestRunStruct{
++		// ProgFD: The file descriptor of the BPF program to test.
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  uint32(len(dataIn)),
++		DataSizeOut: uint32(len(dataOut)),
++		DataIn:      dataIn,
++		DataOut:     dataOut,
++
++		Repeat:   uint32(r.Intn(REPEAT_TIMES)),
++		Duration: r.Uint32(),
++
++		// CtxIn: The `xdp_md` context. Its `data_end` field is now consistent
++		// with the `dataSizeIn` parameter.
++		CtxSizeIn:  uint32(len(ctxIn)),
++		CtxSizeOut: ctxSizeOut,
++		CtxIn:      ctxIn,
++		CtxOut:     ctxOut,
++
++		Flags:     flags,
++		Cpu:       uint32(r.Intn(MAX_CPUS)), // TODO: We can pick a random CPU.
++		BatchSize: batchSize,
++	}
++}
++
++// PatchBpfProgTestRunRawTp constructs valid parameters for the bpf_prog_test_run
++// command targeting a BPF program attached to a raw tracepoint.
++func PatchBpfProgTestRunRawTp(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	var flags uint32
++	var cpu uint32
++
++	// The kernel has a strict check: if BPF_F_TEST_RUN_ON_CPU is not set, cpu must be 0.
++	if r.Intn(2) == 0 {
++		// Standard run on the current CPU.
++		flags = 0
++		cpu = 0
++	} else {
++		// Run on a specific CPU.
++		flags = BPF_F_TEST_RUN_ON_CPU
++		// TODO: We can pick a random CPU.
++		cpu = uint32(r.Intn(MAX_CPUS))
++	}
++
++	// For raw_tp, ctx_size_in cannot exceed MAX_BPF_FUNC_ARGS * sizeof(u64).
++	// We generate a valid size by choosing a random number of u64 arguments.
++	numArgs := r.Intn(MAX_BPF_FUNC_ARGS + 1) // 0 to MAX_BPF_FUNC_ARGS
++
++	// TODO, ctx_in must be a valid context for the specific raw tracepoint.
++	ctxSizeIn := uint32(numArgs * 8)
++	ctxIn := make([]byte, ctxSizeIn)
++	for i := range ctxIn {
++		ctxIn[i] = byte(r.Intn(256))
++	}
++
++	// From the kernel source `bpf_prog_test_run_raw_tp`:
++	// It "doesn't support data_in/out, ctx_out, duration, or repeat".
++	// All corresponding fields must be zero/nil.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		// Unsupported fields, must be zero/nil.
++		DataSizeIn:  0,
++		DataSizeOut: 0,
++		DataIn:      nil,
++		DataOut:     nil,
++
++		Repeat:   0,
++		Duration: 0,
++
++		CtxSizeIn:  ctxSizeIn,
++		CtxSizeOut: 0,
++		CtxIn:      ctxIn,
++		CtxOut:     nil,
++
++		// Supported fields.
++		Flags:     flags,
++		BatchSize: 0,
++		Cpu:       cpu,
++	}
++}
++
++// BpfFlowKeys mirrors the kernel's `struct bpf_flow_keys`.
++type BpfFlowKeys struct {
++	Nhoff       uint16
++	Thoff       uint16
++	AddrProto   uint16
++	IsFrag      uint8
++	IsFirstFrag uint8
++	IsEncap     uint8
++	IpProto     uint8
++	NProto      uint16
++	Sport       uint16
++	Dport       uint16
++	AddrData    [8]uint32 // Union of ipv4 and ipv6 addresses.
++	Flags       uint32
++	FlowLabel   uint32
++}
++
++// NewValidBpfFlowKeysForTestRun creates a valid `bpf_flow_keys` context.
++// According to `verify_user_bpf_flow_keys`, all fields except `flags` must be zero.
++func NewValidBpfFlowKeysForTestRun(r *randGen) []byte {
++	flowKeys := &BpfFlowKeys{
++		Flags: r.Uint32(),
++	}
++	size := unsafe.Sizeof(*flowKeys)
++	data := make([]byte, size)
++	keysBytesView := (*[1 << 30]byte)(unsafe.Pointer(flowKeys))[:size:size]
++	copy(data, keysBytesView)
++	return data
++}
++
++// PatchBpfProgTestRunFlowDissector constructs valid parameters for a flow_dissector program.
++func PatchBpfProgTestRunFlowDissector(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	// DataSizeIn must be at least ETH_HLEN. We use a reasonable upper bound.
++	dataSizeIn := uint32(ETH_HLEN + r.Intn(MAX_Data_SIZE_IN))
++	dataIn := make([]byte, dataSizeIn)
++	for i := range dataIn {
++		dataIn[i] = byte(r.Intn(256))
++	}
++
++	// The context for a flow dissector is `struct bpf_flow_keys`.
++	ctxIn := NewValidBpfFlowKeysForTestRun(r)
++	ctxSizeIn := uint32(len(ctxIn))
++
++	// The kernel copies out the resulting flow_keys to both data_out and ctx_out.
++	dataOut := make([]byte, dataSizeIn)
++	ctxOut := make([]byte, ctxSizeIn)
++
++	// From the kernel source `bpf_prog_test_run_flow_dissector`:
++	// `flags`, `cpu`, and `batch_size` must be zero.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  dataSizeIn,
++		DataSizeOut: uint32(len(dataOut)),
++		DataIn:      dataIn,
++		DataOut:     dataOut,
++
++		Repeat:   1, // Kernel defaults to 1 if 0.
++		Duration: uint32(r.Intn(REPEAT_TIMES)),
++
++		CtxSizeIn:  ctxSizeIn,
++		CtxSizeOut: uint32(len(ctxOut)),
++		CtxIn:      ctxIn,
++		CtxOut:     ctxOut,
++
++		Flags:     0,
++		Cpu:       0,
++		BatchSize: 0,
++	}
++}
++
++// TODO: This function should be improved to create a valid context
++// PatchBpfStructOpsTestRun constructs valid parameters for a struct_ops program.
++func PatchBpfStructOpsTestRun(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	// From `dummy_ops_init_args`, `ctx_size_in` must be a multiple of 8.
++	// We generate a random number of arguments between 1 and 10.
++	numArgs := r.Intn(MAX_BPF_FUNC_ARGS + 3)
++	ctxSizeIn := uint32(numArgs * 8)
++	var ctxIn []byte
++	if r.Intn(2) == 0 {
++		ctxIn = make([]byte, ctxSizeIn)
++		for i := range ctxIn {
++			ctxIn[i] = byte(r.Intn(256))
++		}
++	} else {
++		ctxIn = nil
++	}
++
++	// The kernel copies arguments back, so provide an output buffer.
++	ctxOut := make([]byte, ctxSizeIn)
++
++	dataSizeIn := uint32(r.Intn(65536))
++	dataIn := make([]byte, dataSizeIn)
++	for i := range dataIn {
++		dataIn[i] = byte(r.Intn(256))
++	}
++
++	dataOut := make([]byte, dataSizeIn)
++	for i := range dataOut {
++		dataOut[i] = byte(r.Intn(256))
++	}
++
++	// bpf_struct_ops_test_run doesn't check other fields, just random them.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  dataSizeIn,
++		DataSizeOut: uint32(len(dataOut)),
++		DataIn:      dataIn,
++		DataOut:     dataOut,
++
++		Repeat:   uint32(r.Intn(REPEAT_TIMES)),
++		Duration: uint32(r.Intn(REPEAT_TIMES)),
++
++		CtxSizeIn:  ctxSizeIn,
++		CtxSizeOut: uint32(len(ctxOut)),
++		CtxIn:      ctxIn,
++		CtxOut:     ctxOut,
++
++		Flags:     r.Uint32(),
++		Cpu:       uint32(r.Intn(MAX_CPUS)),
++		BatchSize: r.Uint32(),
++	}
++}
++
++// PatchBpfProgTestRunSyscall constructs valid parameters for a syscall program.
++func PatchBpfProgTestRunSyscall(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	// From `bpf_prog_test_run_syscall`, `ctx_size_in` must be <= U16_MAX.
++	// We ignore the lower bound `prog->aux->max_ctx_offset` for generation.
++	ctxSizeIn := uint32(r.Intn(1 << 16))
++	var ctxIn []byte
++	if ctxSizeIn > 0 {
++		ctxIn = make([]byte, ctxSizeIn)
++		for i := range ctxIn {
++			ctxIn[i] = byte(r.Intn(256))
++		}
++	}
++
++	// From the kernel source, this test run type is very restrictive.
++	// It doesn't support data_in/out, ctx_out, duration, repeat, or flags.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  0,
++		DataSizeOut: 0,
++		DataIn:      nil,
++		DataOut:     nil,
++
++		Repeat:   0,
++		Duration: 0,
++
++		CtxSizeIn:  ctxSizeIn,
++		CtxSizeOut: 0,
++		CtxIn:      ctxIn,
++		CtxOut:     nil,
++
++		Flags:     0,
++		Cpu:       uint32(r.Intn(MAX_CPUS)), // The cpu field is not used.
++		BatchSize: 0,
++	}
++}
++
++// PatchBpfProgTestRunTracing constructs valid parameters for a tracing program
++// (fentry, fexit, fmod_ret).
++func PatchBpfProgTestRunTracing(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	// From the kernel source `bpf_prog_test_run_tracing`:
++	// - `flags`, `cpu`, and `batch_size` must be zero.
++	// - The function does not use any data_in/out or ctx_in/out buffers from
++	//   the user. It runs a series of internal, hardcoded tests.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  0,
++		DataSizeOut: 0,
++		DataIn:      nil,
++		DataOut:     nil,
++
++		Repeat:   0,
++		Duration: 0,
++
++		CtxSizeIn:  0,
++		CtxSizeOut: 0,
++		CtxIn:      nil,
++		CtxOut:     nil,
++
++		Flags:     0,
++		Cpu:       0,
++		BatchSize: 0,
++	}
++}
++
++type BpfSkLookup struct {
++	SkOrCookie     uint64
++	Family         uint32
++	Protocol       uint32
++	RemoteIp4      uint32
++	RemoteIp6      [4]uint32
++	RemotePort     uint16
++	Padding        uint16
++	LocalIp4       uint32
++	LocalIp6       [4]uint32
++	LocalPort      uint32
++	IngressIfindex uint32
++}
++
++// NewValidBpfSkLookupForTestRun creates a valid `bpf_sk_lookup` context.
++func NewValidBpfSkLookupForTestRun(r *randGen) []byte {
++	ctx := &BpfSkLookup{
++		// sk (or cookie) must be 0 on input.
++		SkOrCookie: 0,
++		// ingress_ifindex must be 0 on input.
++		IngressIfindex: 0,
++		// local_port must be <= U16_MAX.
++		LocalPort: uint32(r.Intn(U16_MAX + 1)),
++		Protocol:  uint32(r.Intn(IPPROTO_MAX + 1)), // Random protocol number.
++	}
++
++	if r.Intn(2) == 0 {
++		ctx.Family = AF_INET
++		ctx.LocalIp4 = r.Uint32()
++		ctx.RemoteIp4 = r.Uint32()
++	} else {
++		ctx.Family = AF_INET6
++		for i := 0; i < 4; i++ {
++			ctx.LocalIp6[i] = r.Uint32()
++			ctx.RemoteIp6[i] = r.Uint32()
++		}
++	}
++
++	// RemotePort is big-endian, but for random bytes, endianness doesn't matter.
++	ctx.RemotePort = uint16(r.Uint32())
++
++	size := unsafe.Sizeof(*ctx)
++	data := make([]byte, size)
++	ctxBytesView := (*[1 << 30]byte)(unsafe.Pointer(ctx))[:size:size]
++	copy(data, ctxBytesView)
++	return data
++}
++
++// PatchBpfProgTestRunSkLookup constructs valid parameters for an sk_lookup program.
++func PatchBpfProgTestRunSkLookup(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	ctxIn := NewValidBpfSkLookupForTestRun(r)
++	ctxSizeIn := uint32(len(ctxIn))
++	ctxOut := make([]byte, ctxSizeIn)
++
++	// From the kernel source `bpf_prog_test_run_sk_lookup`:
++	// - `flags`, `cpu`, and `batch_size` must be zero.
++	// - `data_in/out` must be NULL.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  0,
++		DataSizeOut: 0,
++		DataIn:      nil,
++		DataOut:     nil,
++
++		Repeat:   uint32(r.Intn(REPEAT_TIMES)),
++		Duration: uint32(r.Intn(REPEAT_TIMES)),
++
++		CtxSizeIn:  ctxSizeIn,
++		CtxSizeOut: uint32(len(ctxOut)),
++		CtxIn:      ctxIn,
++		CtxOut:     ctxOut,
++
++		Flags:     0,
++		Cpu:       0,
++		BatchSize: 0,
++	}
++}
++
++// According to `verify_and_copy_hook_state`, only `hook` and `pf` can be set by the user.
++// The other fields (in, out, sk, net, okfn) must be zero.
++type NfHookState struct {
++	Hook uint8
++	Pf   uint8
++	_    [6]byte // Padding
++	In   uint64
++	Out  uint64
++	Sk   uint64
++	Net  uint64
++	Okfn uint64
++}
++
++// NewValidNfHookStateForTestRun creates a valid `nf_hook_state` context.
++func NewValidNfHookStateForTestRun(r *randGen) *NfHookState {
++	validHooks := []uint8{
++		NF_INET_PRE_ROUTING,
++		NF_INET_LOCAL_IN,
++		NF_INET_FORWARD,
++		NF_INET_LOCAL_OUT,
++		NF_INET_POST_ROUTING,
++	}
++	validPfs := []uint8{
++		NFPROTO_IPV4,
++		NFPROTO_IPV6,
++	}
++	ctx := &NfHookState{
++		Hook: validHooks[r.Intn(len(validHooks))],
++		Pf:   validPfs[r.Intn(len(validPfs))],
++	}
++	return ctx
++}
++
++// PatchBpfProgTestRunNf constructs valid parameters for a netfilter program.
++func PatchBpfProgTestRunNf(r *randGen, bpfProg *BpfProg) BpfProgTestRunStruct {
++	// 1. Generate the context (nf_hook_state).
++	nfCtx := NewValidNfHookStateForTestRun(r)
++	sizeOfNfCtx := unsafe.Sizeof(*nfCtx)
++	ctxIn := make([]byte, sizeOfNfCtx)
++	ctxBytesView := (*[1 << 30]byte)(unsafe.Pointer(nfCtx))[:sizeOfNfCtx:sizeOfNfCtx]
++	copy(ctxIn, ctxBytesView)
++
++	ctxSizeOut := uint32(r.Intn(MAX_Data_SIZE_IN * 2))
++	ctxOut := make([]byte, ctxSizeOut)
++	for i := range ctxOut {
++		ctxOut[i] = byte(r.Intn(256))
++	}
++
++	// 2. Determine the minimum data size based on the context.
++	var minDataSize uint32
++	if nfCtx.Hook == NF_INET_LOCAL_OUT {
++		minDataSize = SIZE_OF_IPHDR
++	} else {
++		if nfCtx.Pf == NFPROTO_IPV4 {
++			minDataSize = ETH_HLEN + SIZE_OF_IPHDR
++		} else { // NFPROTO_IPV6
++			minDataSize = ETH_HLEN + SIZE_OF_IPV6HDR
++		}
++	}
++
++	// Generate a random size that meets the minimum requirement.
++	var dataSizeIn uint32
++	var dataIn []byte
++	if r.Float64() > PACKET_FORGE_RATE {
++		// Create random input data.
++		dataSizeIn = minDataSize + uint32(r.Intn(MAX_Data_SIZE_IN))
++		dataIn = make([]byte, dataSizeIn)
++		for i := range dataIn {
++			dataIn[i] = byte(r.Intn(256))
++		}
++	} else {
++		// Create structured, valid packet data.
++		dataIn = NewValidSkBuffPacketData(r)
++		dataSizeIn = uint32(len(dataIn))
++	}
++	// fmt.Printf("BpfProgFilePath:%s, skb packet data of size %d bytes:\n", bpfProg.BpfProgFilePath, dataSizeIn)
++
++	// 3. Allocate DataOut buffer as bpf_test_finish will be called.
++	dataOut := make([]byte, dataSizeIn)
++	for i := range dataOut {
++		dataOut[i] = byte(r.Intn(256))
++	}
++
++	// From the kernel source `bpf_prog_test_run_nf`:
++	// - `flags`, `cpu`, and `batch_size` must be zero.
++	return BpfProgTestRunStruct{
++		ProgFD: bpfProg.BpfProgContext.ProgFD,
++
++		DataSizeIn:  dataSizeIn,
++		DataSizeOut: uint32(len(dataOut)),
++		DataIn:      dataIn,
++		DataOut:     dataOut,
++
++		Repeat:   uint32(r.Intn(REPEAT_TIMES)),
++		Duration: r.Uint32(),
++
++		CtxSizeIn:  uint32(sizeOfNfCtx),
++		CtxSizeOut: ctxSizeOut,
++		CtxIn:      ctxIn,
++		CtxOut:     ctxOut,
++
++		Flags:     0,
++		Cpu:       0,
++		BatchSize: 0,
++	}
++}
++
++func SetupProgTestRunContext(r *randGen, bpfProg *BpfProg) (BpfProgTestRunStruct, bool) {
++	selectProgType := bpfProg.BpfProgContext.ProgType
++	// fmt.Printf("BpfProgFilePath: %s, bpfProg.BpfProgContext.ProgType: %d\n", bpfProg.BpfProgFilePath, selectProgType)
++	switch selectProgType {
++	case BPF_PROG_TYPE_SOCKET_FILTER, BPF_PROG_TYPE_SCHED_CLS, BPF_PROG_TYPE_SCHED_ACT, BPF_PROG_TYPE_CGROUP_SKB,
++		BPF_PROG_TYPE_LWT_IN, BPF_PROG_TYPE_LWT_OUT, BPF_PROG_TYPE_LWT_XMIT, BPF_PROG_TYPE_LWT_SEG6LOCAL:
++		return PatchBpfProgTestRunSkb(r, bpfProg), true
++	case BPF_PROG_TYPE_XDP:
++		return PatchBpfProgTestRunXDP(r, bpfProg), true
++	case BPF_PROG_TYPE_RAW_TRACEPOINT:
++		return PatchBpfProgTestRunRawTp(r, bpfProg), true
++	case BPF_PROG_TYPE_FLOW_DISSECTOR:
++		return PatchBpfProgTestRunFlowDissector(r, bpfProg), true
++	case BPF_PROG_TYPE_STRUCT_OPS:
++		return PatchBpfStructOpsTestRun(r, bpfProg), true
++	case BPF_PROG_TYPE_SYSCALL:
++		return PatchBpfProgTestRunSyscall(r, bpfProg), true
++	case BPF_PROG_TYPE_TRACING:
++		return PatchBpfProgTestRunTracing(r, bpfProg), true
++	case BPF_PROG_TYPE_SK_LOOKUP:
++		return PatchBpfProgTestRunSkLookup(r, bpfProg), true
++	case BPF_PROG_TYPE_NETFILTER:
++		return PatchBpfProgTestRunNf(r, bpfProg), true
++	default:
++		return PatchBpfProgTestRunSkb(r, bpfProg), false
++	}
++}
++
++func (Ldbf *LLMDrivenBPFuzzer) genLdbfProgTestRunCall(r *randGen, s *state, bpfProg *BpfProg) (calls []*Call) {
++	meta := r.target.SyscallMap["bpf$LDBF_BPF_PROG_TEST_RUN"]
++	args := make([]Arg, len(meta.Args))
++	c := MakeCall(meta, nil)
++
++	ProgTestRunContext, supported := SetupProgTestRunContext(r, bpfProg)
++	if !supported {
++		return calls
++	}
++
++	cmdArg := meta.Args[0]
++	args[0], _ = r.generateArg(s, cmdArg.Type, cmdArg.Dir(DirIn))
++
++	testProgArg := meta.Args[1]
++	testProgPtr := testProgArg.Type.(*PtrType)
++	testProgStruct := testProgPtr.Elem.(*StructType)
++	testProgStructDir := testProgPtr.ElemDir
++
++	testProgStructFields := make([]Arg, len(testProgStruct.Fields))
++	for testProgStructFieldIdx, testProgStructField := range testProgStruct.Fields {
++		var newArg Arg
++		bpfProgTypeFieldDir := testProgStructField.Dir(testProgStructDir)
++		switch testProgStructFieldIdx {
++		case 0: // prog_fd, ResourceType
++			newArg = MakeResultArg(testProgStructField.Type, bpfProgTypeFieldDir, ProgTestRunContext.ProgFD, 0)
++		case 1: // retval
++		case 2: // data_size_in
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.DataSizeIn))
++		case 3: // data_size_out
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.DataSizeOut))
++		case 4: // data_in
++			dataInBuffer := testProgStructField.Type.(*PtrType).Elem.(*BufferType)
++			dataInBufferDir := testProgStructField.Type.(*PtrType).ElemDir
++			inner := MakeDataArg(dataInBuffer, dataInBufferDir, ProgTestRunContext.DataIn)
++			newArg = r.allocAddr(s, testProgStructField.Type, bpfProgTypeFieldDir, inner.Size(), inner)
++		case 5: // data_out
++			dataOutBuffer := testProgStructField.Type.(*PtrType).Elem.(*BufferType)
++			dataOutBufferDir := testProgStructField.Type.(*PtrType).ElemDir
++			inner := MakeOutDataArg(dataOutBuffer, dataOutBufferDir, uint64(len(ProgTestRunContext.DataOut)))
++			newArg = r.allocAddr(s, testProgStructField.Type, bpfProgTypeFieldDir, inner.Size(), inner)
++		case 6: // repeat, IntType
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.Repeat))
++		case 7: // duration, ConstType
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.Duration))
++		case 8: // ctx_size_in
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.CtxSizeIn))
++		case 9: // ctx_size_out
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.CtxSizeOut))
++		case 10: // ctx_in
++			ctxInBuffer := testProgStructField.Type.(*PtrType).Elem.(*BufferType)
++			ctxInBufferDir := testProgStructField.Type.(*PtrType).ElemDir
++			inner := MakeDataArg(ctxInBuffer, ctxInBufferDir, ProgTestRunContext.CtxIn)
++			newArg = r.allocAddr(s, testProgStructField.Type, bpfProgTypeFieldDir, inner.Size(), inner)
++		case 11: // ctx_out
++			ctxOutBuffer := testProgStructField.Type.(*PtrType).Elem.(*BufferType)
++			ctxOutBufferDir := testProgStructField.Type.(*PtrType).ElemDir
++			inner := MakeDataArg(ctxOutBuffer, ctxOutBufferDir, ProgTestRunContext.CtxOut)
++			newArg = r.allocAddr(s, testProgStructField.Type, bpfProgTypeFieldDir, inner.Size(), inner)
++		case 12: // flags, FlagsType
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.Flags))
++		case 13: // cpu, ConstType
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.Cpu))
++		case 14: // batch_size, IntType
++			newArg = MakeConstArg(testProgStructField.Type, bpfProgTypeFieldDir, uint64(ProgTestRunContext.BatchSize))
++		}
++		if newArg != nil {
++			testProgStructFields[testProgStructFieldIdx] = newArg
++		} else {
++			testProgStructFields[testProgStructFieldIdx], _ = r.generateArg(s, testProgStructField.Type, testProgStructField.Dir(DirIn))
++		}
++	}
++
++	testProgStructArg := MakeGroupArg(testProgStruct, testProgStructDir, testProgStructFields)
++	args[1] = r.allocAddr(s, testProgArg.Type, testProgArg.Dir(DirIn), testProgStructArg.Size(), testProgStructArg)
++
++	lenArg := meta.Args[2]
++	args[2], _ = r.generateArg(s, lenArg.Type, lenArg.Dir(DirIn))
++
++	c.Args = args
++	// moreCalls, _ := r.patchConditionalFields(c, s)
++	// r.target.assignSizesCall(c)
++	// return append(append(calls, moreCalls...), c)
++
++	r.target.assignSizesCall(c)
++
++	var currentBpfMapCall []*Call
++	return append(currentBpfMapCall, c)
++}
+diff --git a/prog/mutation.go b/prog/mutation.go
+index eb9e8285d..499e331f8 100644
+--- a/prog/mutation.go
++++ b/prog/mutation.go
+@@ -55,11 +55,13 @@ func (o MutateOpts) weight() int {
+ 
+ func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMutate map[int]bool,
+ 	corpus []*Prog, opts MutateOpts) {
++	// fmt.Printf("Mutating program %v with opts: %+v\n", p, opts)
+ 	if p.isUnsafe {
+ 		panic("mutation of unsafe programs is not supposed to be done")
+ 	}
+ 	totalWeight := opts.weight()
+ 	r := newRand(p.Target, rs)
++
+ 	ncalls = max(ncalls, len(p.Calls))
+ 	ctx := &mutator{
+ 		p:        p,
+diff --git a/prog/prog.go b/prog/prog.go
+index 89b0e794b..d1d28ecdb 100644
+--- a/prog/prog.go
++++ b/prog/prog.go
+@@ -15,6 +15,22 @@ type Prog struct {
+ 
+ 	// Was deserialized using Unsafe mode, so can do unsafe things.
+ 	isUnsafe bool
++
++	// init LLM Driven Bpf Fuzzer
++	Ldbf *LLMDrivenBPFuzzer
++}
++
++func (p *Prog) initLDBP(r *randGen, s *state) {
++	enable := true
++	if p.Ldbf != nil {
++		return
++	}
++	p.Ldbf = NewLLMDrivenBPFFuzzer(enable)
++	if p.Ldbf == nil {
++		return
++	}
++	// Initialize LDBF prologue.
++	p.Ldbf.GenLdbfPrologue(r, s, p)
+ }
+ 
+ const ExtraCallName = ".extra"
+diff --git a/sample.config b/sample.config
+new file mode 100644
+index 000000000..f56d0113f
+--- /dev/null
++++ b/sample.config
+@@ -0,0 +1,32 @@
++{
++	"enable_syscalls": [
++        "bpf$LDBF*",
++        "bpf",
++        "perf_event_open",
++        "perf_event_open$cgroup",
++        "open",
++        "openat$cgroup",
++        "openat$cgroup_root",
++        "clone3",
++        "openat$pidfd",
++        "openat$thread_pidfd",
++        "socket$inet_udp",
++        "socket$inet_udplite",
++        "socket$inet6_udp",
++        "socket$inet6_udplite",
++        "socket$inet_mptcp",
++        "socket$inet_tcp",
++        "socket$inet6_mptcp",
++        "socket$inet6_tcp",
++        "socket$inet",
++		"bind$inet",
++		"sendmsg$inet",
++        "getpid",
++        "read",
++        "write",
++        "close",
++		"connect$inet",
++        "setsockopt$sock_attach_bpf",
++        "ioctl$sock_SIOCGIFINDEX"
++	]
++}
+diff --git a/sys/linux/bpf.txt b/sys/linux/bpf.txt
+index 2f4a7bd50..7a6e670e8 100644
+--- a/sys/linux/bpf.txt
++++ b/sys/linux/bpf.txt
+@@ -86,6 +86,13 @@ bpf$LINK_DETACH(cmd const[BPF_LINK_DETACH], arg ptr[in, fd_bpf_link], size len[a
+ bpf$PROG_BIND_MAP(cmd const[BPF_PROG_BIND_MAP], arg ptr[in, bpf_prog_bind_map_arg], size len[arg])
+ bpf$TOKEN_CREATE(cmd const[BPF_TOKEN_CREATE], arg ptr[in, bpf_token_create_arg], size len[arg]) fd_bpf_token
+ 
++bpf$LDBF_MAP_CREATE(cmd const[BPF_MAP_CREATE], arg ptr[in, bpf_map_create_arg], size len[arg]) fd_bpf_map
++bpf$LDBF_PROG_LOAD(cmd const[BPF_PROG_LOAD], arg ptr[in, bpf_prog], size len[arg]) fd_bpf_prog
++bpf$LDBF_BPF_PROG_ATTACH(cmd const[BPF_PROG_ATTACH], arg ptr[in, bpf_attach_arg], size len[arg])
++bpf$LDBF_BPF_PROG_TEST_RUN(cmd const[BPF_PROG_TEST_RUN], arg ptr[in, bpf_test_prog_arg], size len[arg])
++bpf$LDBF_BPF_BTF_LOAD(cmd const[BPF_BTF_LOAD], arg ptr[in, bpf_btf_load], size len[arg]) fd_btf
++bpf$LDBF_LINK_CREATE(cmd const[BPF_LINK_CREATE], arg ptr[in, bpf_link_create_arg], size len[arg]) fd_bpf_link
++
+ resource fd_bpf_prog_xdp[fd_bpf_prog]
+ bpf$PROG_LOAD_XDP(cmd const[BPF_PROG_LOAD], arg ptr[in, bpf_prog_xdp], size len[arg]) fd_bpf_prog_xdp
+ bpf$BPF_LINK_CREATE_XDP(cmd const[BPF_LINK_CREATE], arg ptr[in, bpf_link_create_xdp], size len[arg]) fd_bpf_link
+diff --git a/vm/vm.go b/vm/vm.go
+index 522cf5aa8..25c33680f 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -17,6 +17,7 @@ import (
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -422,6 +423,10 @@ func (mon *monitor) monitorExecution() *report.Report {
+ func (mon *monitor) appendOutput(out []byte) (*report.Report, bool) {
+ 	lastPos := len(mon.output)
+ 	mon.output = append(mon.output, out...)
++	// record kernel log if enabled
++	if len(out) > 0 {
++		saveKernelLogRealtime(mon.inst.Index(), out)
++	}
+ 	if bytes.Contains(mon.output[lastPos:], executingProgram) {
+ 		mon.lastExecuteTime = time.Now()
+ 	}
+@@ -487,6 +492,7 @@ func (mon *monitor) extractError(defaultError string) *report.Report {
+ 	if len(diagOutput) > 0 {
+ 		rep.Output = append(rep.Output, vmDiagnosisStart...)
+ 		rep.Output = append(rep.Output, diagOutput...)
++		saveKernelLogRealtime(mon.inst.Index(), append(rep.Output, "\n\n"...))
+ 	}
+ 	return rep
+ }
+@@ -552,3 +558,99 @@ var (
+ 
+ 	tickerPeriod = 10 * time.Second
+ )
++
++var (
++	kernelLogManager *KernelLogManager
++	kernelLogOnce    sync.Once
++)
++
++type KernelLogManager struct {
++	mu      sync.Mutex
++	writers map[int]*os.File      // vmIndex -> file handler
++	buffers map[int]*bytes.Buffer // vmIndex -> buffer for partial lines
++	logDir  string
++	enabled bool
++}
++
++func getKernelLogManager() *KernelLogManager {
++	kernelLogOnce.Do(func() {
++		var enabled bool
++		// get logDir from environment variable or config
++		logDir := os.Getenv("LDBF_KERNEL_LOG_DIR")
++		if logDir != "" {
++			logDir = filepath.Join(logDir)
++			enabled = true
++		} else {
++			enabled = false
++		}
++
++		kernelLogManager = &KernelLogManager{
++			writers: make(map[int]*os.File),
++			buffers: make(map[int]*bytes.Buffer),
++			logDir:  logDir,
++			enabled: enabled,
++		}
++
++		if enabled {
++			os.MkdirAll(logDir, osutil.DefaultDirPerm)
++		}
++	})
++	return kernelLogManager
++}
++
++func saveKernelLogRealtime(vmIndex int, data []byte) {
++	manager := getKernelLogManager()
++	if !manager.enabled || len(data) == 0 {
++		return
++	}
++
++	manager.mu.Lock()
++	defer manager.mu.Unlock()
++
++	// access or create the log file for this VM
++	writer, exists := manager.writers[vmIndex]
++	if !exists {
++		filename := fmt.Sprintf("vm_%d_kernel.log", vmIndex)
++		filepath := filepath.Join(manager.logDir, filename)
++
++		file, err := os.OpenFile(filepath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, osutil.DefaultFilePerm)
++		if err != nil {
++			return
++		}
++
++		manager.writers[vmIndex] = file
++		manager.buffers[vmIndex] = &bytes.Buffer{}
++		writer = file
++
++		// write start timestamp
++		timestamp := time.Now().Format("2006-01-02 15:04:05")
++		writer.WriteString(fmt.Sprintf("\n=== VM %d kernel log started at %s ===\n", vmIndex, timestamp))
++	}
++
++	// get the buffer
++	buffer := manager.buffers[vmIndex]
++
++	// write data to buffer
++	buffer.Write(data)
++
++	// for each complete line, write to file
++	for {
++		line, err := buffer.ReadBytes('\n')
++		if err != nil {
++			// if no complete line, put data back to buffer
++			buffer = &bytes.Buffer{}
++			buffer.Write(line)
++			manager.buffers[vmIndex] = buffer
++			break
++		}
++
++		// add time stamp prefix (optional)
++		timestamp := time.Now().Format("15:04:05.000")
++		timestampedLine := fmt.Sprintf("[%s] %s", timestamp, string(line))
++
++		if _, err := writer.WriteString(timestampedLine); err == nil {
++			// flush to disk
++			writer.Sync()
++		}
++	}
++}

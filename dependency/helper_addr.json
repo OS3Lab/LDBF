@@ -1,0 +1,691 @@
+{
+    "bpf_map_lookup_elem": [
+        "kernel/bpf/helpers.c,bpf_map_lookup_elem"
+    ],
+    "bpf_map_update_elem": [
+        "kernel/bpf/helpers.c,bpf_map_update_elem"
+    ],
+    "bpf_map_delete_elem": [
+        "kernel/bpf/helpers.c,bpf_map_delete_elem"
+    ],
+    "bpf_probe_read": [
+        "kernel/trace/bpf_trace.c,bpf_probe_read_compat_str",
+        "kernel/trace/bpf_trace.c,bpf_probe_read_compat"
+    ],
+    "bpf_ktime_get_ns": [
+        "kernel/bpf/helpers.c,bpf_ktime_get_ns"
+    ],
+    "bpf_trace_printk": [
+        "kernel/trace/bpf_trace.c,bpf_trace_printk"
+    ],
+    "bpf_get_prandom_u32": [
+        "kernel/bpf/core.c,bpf_user_rnd_u32"
+    ],
+    "bpf_get_smp_processor_id": [
+        "kernel/bpf/helpers.c,bpf_get_smp_processor_id"
+    ],
+    "bpf_skb_store_bytes": [
+        "net/core/filter.c,bpf_skb_store_bytes"
+    ],
+    "bpf_l3_csum_replace": [
+        "net/core/filter.c,bpf_l3_csum_replace"
+    ],
+    "bpf_l4_csum_replace": [
+        "net/core/filter.c,bpf_l4_csum_replace"
+    ],
+    "bpf_tail_call": [],
+    "bpf_clone_redirect": [
+        "net/core/filter.c,bpf_clone_redirect"
+    ],
+    "bpf_get_current_pid_tgid": [
+        "kernel/bpf/helpers.c,bpf_get_current_pid_tgid"
+    ],
+    "bpf_get_current_uid_gid": [
+        "kernel/bpf/helpers.c,bpf_get_current_uid_gid"
+    ],
+    "bpf_get_current_comm": [
+        "kernel/bpf/helpers.c,bpf_get_current_comm"
+    ],
+    "bpf_get_cgroup_classid": [
+        "net/core/filter.c,bpf_get_cgroup_classid_curr",
+        "net/core/filter.c,bpf_get_cgroup_classid.cold",
+        "net/core/filter.c,bpf_get_cgroup_classid"
+    ],
+    "bpf_skb_vlan_push": [
+        "net/core/filter.c,bpf_skb_vlan_push"
+    ],
+    "bpf_skb_vlan_pop": [
+        "net/core/filter.c,bpf_skb_vlan_pop"
+    ],
+    "bpf_skb_get_tunnel_key": [
+        "net/core/filter.c,bpf_skb_get_tunnel_key"
+    ],
+    "bpf_skb_set_tunnel_key": [
+        "net/core/filter.c,bpf_skb_set_tunnel_key"
+    ],
+    "bpf_perf_event_read": [
+        "kernel/trace/bpf_trace.c,bpf_perf_event_read"
+    ],
+    "bpf_redirect": [
+        "net/core/filter.c,bpf_redirect"
+    ],
+    "bpf_get_route_realm": [
+        "net/core/filter.c,bpf_get_route_realm"
+    ],
+    "bpf_perf_event_output": [
+        "kernel/trace/bpf_trace.c,bpf_perf_event_output_tp",
+        "kernel/trace/bpf_trace.c,bpf_perf_event_output_raw_tp",
+        "kernel/trace/bpf_trace.c,bpf_perf_event_output"
+    ],
+    "bpf_skb_load_bytes": [
+        "net/core/filter.c,bpf_skb_load_bytes"
+    ],
+    "bpf_get_stackid": [
+        "kernel/bpf/stackmap.c,bpf_get_stackid_pe",
+        "kernel/bpf/stackmap.c,bpf_get_stackid",
+        "kernel/trace/bpf_trace.c,bpf_get_stackid_tp",
+        "kernel/trace/bpf_trace.c,bpf_get_stackid_raw_tp"
+    ],
+    "bpf_csum_diff": [
+        "net/core/filter.c,bpf_csum_diff"
+    ],
+    "bpf_skb_get_tunnel_opt": [
+        "net/core/filter.c,bpf_skb_get_tunnel_opt"
+    ],
+    "bpf_skb_set_tunnel_opt": [
+        "net/core/filter.c,bpf_skb_set_tunnel_opt"
+    ],
+    "bpf_skb_change_proto": [
+        "net/core/filter.c,bpf_skb_change_proto"
+    ],
+    "bpf_skb_change_type": [
+        "net/core/filter.c,bpf_skb_change_type"
+    ],
+    "bpf_skb_under_cgroup": [
+        "net/core/filter.c,bpf_skb_under_cgroup",
+        "net/core/filter.c,bpf_skb_under_cgroup.cold"
+    ],
+    "bpf_get_hash_recalc": [
+        "net/core/filter.c,bpf_get_hash_recalc"
+    ],
+    "bpf_get_current_task": [
+        "kernel/trace/bpf_trace.c,bpf_get_current_task"
+    ],
+    "bpf_probe_write_user": [
+        "kernel/trace/bpf_trace.c,bpf_probe_write_user"
+    ],
+    "bpf_current_task_under_cgroup": [
+        "kernel/bpf/helpers.c,bpf_current_task_under_cgroup"
+    ],
+    "bpf_skb_change_tail": [
+        "net/core/filter.c,bpf_skb_change_tail"
+    ],
+    "bpf_skb_pull_data": [
+        "net/core/filter.c,bpf_skb_pull_data"
+    ],
+    "bpf_csum_update": [
+        "net/core/filter.c,bpf_csum_update"
+    ],
+    "bpf_set_hash_invalid": [
+        "net/core/filter.c,bpf_set_hash_invalid"
+    ],
+    "bpf_get_numa_node_id": [
+        "kernel/bpf/helpers.c,bpf_get_numa_node_id"
+    ],
+    "bpf_skb_change_head": [
+        "net/core/filter.c,bpf_skb_change_head"
+    ],
+    "bpf_xdp_adjust_head": [
+        "net/core/filter.c,bpf_xdp_adjust_head"
+    ],
+    "bpf_probe_read_str": [], 
+    "bpf_get_socket_cookie": [
+        "net/core/filter.c,bpf_get_socket_cookie_sock_ops",
+        "net/core/filter.c,bpf_get_socket_cookie_sock_addr",
+        "net/core/filter.c,bpf_get_socket_cookie_sock",
+        "net/core/filter.c,bpf_get_socket_cookie"
+    ],
+    "bpf_get_socket_uid": [
+        "net/core/filter.c,bpf_get_socket_uid.cold",
+        "net/core/filter.c,bpf_get_socket_uid"
+    ],
+    "bpf_set_hash": [
+        "net/core/filter.c,bpf_set_hash"
+    ],
+    "bpf_setsockopt": [
+        "net/core/filter.c,bpf_sk_setsockopt.cold",
+        "net/core/filter.c,bpf_sk_setsockopt"
+    ],
+    "bpf_skb_adjust_room": [
+        "net/core/filter.c,bpf_skb_adjust_room"
+    ],
+    "bpf_redirect_map": [
+        "net/core/filter.c,bpf_xdp_redirect_map"
+    ],
+    "bpf_sk_redirect_map": [
+        "net/core/sock_map.c,bpf_sk_redirect_map"
+    ],
+    "bpf_sock_map_update": [
+        "net/core/sock_map.c,bpf_sock_map_update"
+    ],
+    "bpf_xdp_adjust_meta": [
+        "net/core/filter.c,bpf_xdp_adjust_meta"
+    ],
+    "bpf_perf_event_read_value": [
+        "kernel/trace/bpf_trace.c,bpf_perf_event_read_value"
+    ],
+    "bpf_perf_prog_read_value": [
+        "kernel/trace/bpf_trace.c,bpf_perf_prog_read_value"
+    ],
+    "bpf_getsockopt": [
+        "net/core/filter.c,bpf_sk_getsockopt.cold",
+        "net/core/filter.c,bpf_sk_getsockopt"
+    ],
+    "bpf_override_return": [],
+    "bpf_sock_ops_cb_flags_set": [
+        "net/core/filter.c,bpf_sock_ops_cb_flags_set",
+        "net/core/filter.c,bpf_sock_ops_cb_flags_set.cold"
+    ],
+    "bpf_msg_redirect_map": [
+        "net/core/sock_map.c,bpf_msg_redirect_map"
+    ],
+    "bpf_msg_apply_bytes": [
+        "net/core/filter.c,bpf_msg_apply_bytes"
+    ],
+    "bpf_msg_cork_bytes": [
+        "net/core/filter.c,bpf_msg_cork_bytes"
+    ],
+    "bpf_msg_pull_data": [
+        "net/core/filter.c,bpf_msg_pull_data"
+    ],
+    "bpf_bind": [
+        "net/core/filter.c,bpf_bind"
+    ],
+    "bpf_xdp_adjust_tail": [
+        "net/core/filter.c,bpf_xdp_adjust_tail"
+    ],
+    "bpf_skb_get_xfrm_state": [
+        "net/core/filter.c,bpf_skb_get_xfrm_state"
+    ],
+    "bpf_get_stack": [
+        "kernel/bpf/stackmap.c,bpf_get_stack_pe",
+        "kernel/bpf/stackmap.c,bpf_get_stack",
+        "kernel/bpf/stackmap.c,bpf_get_stack_sleepable",
+        "kernel/trace/bpf_trace.c,bpf_get_stack_tp",
+        "kernel/trace/bpf_trace.c,bpf_get_stack_raw_tp"
+    ],
+    "bpf_skb_load_bytes_relative": [
+        "net/core/filter.c,bpf_skb_load_bytes_relative"
+    ],
+    "bpf_fib_lookup": [
+        "net/core/filter.c,bpf_skb_fib_lookup"
+    ],
+    "bpf_sock_hash_update": [
+        "net/core/sock_map.c,bpf_sock_hash_update"
+    ],
+    "bpf_msg_redirect_hash": [
+        "net/core/sock_map.c,bpf_msg_redirect_hash"
+    ],
+    "bpf_sk_redirect_hash": [
+        "net/core/sock_map.c,bpf_sk_redirect_hash"
+    ],
+    "bpf_lwt_push_encap": [
+        "net/core/filter.c,bpf_lwt_in_push_encap"
+    ],
+    "bpf_lwt_seg6_store_bytes": [
+        "net/core/filter.c,bpf_lwt_seg6_store_bytes"
+    ],
+    "bpf_lwt_seg6_adjust_srh": [
+        "net/core/filter.c,bpf_lwt_seg6_adjust_srh"
+    ],
+    "bpf_lwt_seg6_action": [
+        "net/core/filter.c,bpf_lwt_seg6_action"
+    ],
+    "bpf_rc_repeat": [
+        "drivers/media/rc/bpf-lirc.c,bpf_rc_repeat"
+    ],
+    "bpf_rc_keydown": [
+        "drivers/media/rc/bpf-lirc.c,bpf_rc_keydown"
+    ],
+    "bpf_skb_cgroup_id": [
+        "net/core/filter.c,bpf_skb_cgroup_id.cold",
+        "net/core/filter.c,bpf_skb_cgroup_id"
+    ],
+    "bpf_get_current_cgroup_id": [
+        "kernel/bpf/helpers.c,bpf_get_current_cgroup_id"
+    ],
+    "bpf_get_local_storage": [
+        "kernel/bpf/cgroup.c,bpf_get_local_storage"
+    ],
+    "bpf_skb_ancestor_cgroup_id": [
+        "net/core/filter.c,bpf_skb_ancestor_cgroup_id",
+        "net/core/filter.c,bpf_skb_ancestor_cgroup_id.cold"
+    ],
+    "bpf_sk_select_reuseport": [
+        "net/core/filter.c,sk_select_reuseport",
+        "net/core/filter.c,sk_select_reuseport.cold"
+    ],
+    "bpf_sk_lookup_tcp": [
+        "net/core/filter.c,bpf_sk_lookup_tcp"
+    ],
+    "bpf_sk_lookup_udp": [
+        "net/core/filter.c,bpf_sk_lookup_udp"
+    ],
+    "bpf_sk_release": [
+        "net/core/filter.c,bpf_sk_release",
+        "net/core/filter.c,bpf_sk_release.cold"
+    ],
+    "bpf_map_push_elem": [
+        "kernel/bpf/helpers.c,bpf_map_push_elem"
+    ],
+    "bpf_map_pop_elem": [
+        "kernel/bpf/helpers.c,bpf_map_pop_elem"
+    ],
+    "bpf_map_peek_elem": [
+        "kernel/bpf/helpers.c,bpf_map_peek_elem"
+    ],
+    "bpf_msg_push_data": [
+        "net/core/filter.c,bpf_msg_push_data"
+    ],
+    "bpf_msg_pop_data": [
+        "net/core/filter.c,bpf_msg_pop_data"
+    ],
+    "bpf_rc_pointer_rel": [
+        "drivers/media/rc/bpf-lirc.c,bpf_rc_pointer_rel"
+    ],
+    "bpf_spin_lock": [
+        "kernel/bpf/helpers.c,bpf_spin_lock"
+    ],
+    "bpf_spin_unlock": [
+        "kernel/bpf/helpers.c,bpf_spin_unlock"
+    ],
+    "bpf_sk_fullsock": [
+        "net/core/filter.c,bpf_sk_fullsock.cold",
+        "net/core/filter.c,bpf_sk_fullsock"
+    ],
+    "bpf_tcp_sock": [
+        "net/core/filter.c,bpf_tcp_sock",
+        "net/core/filter.c,bpf_tcp_sock.cold"
+    ],
+    "bpf_skb_ecn_set_ce": [
+        "net/core/filter.c,bpf_skb_ecn_set_ce"
+    ],
+    "bpf_get_listener_sock": [
+        "net/core/filter.c,bpf_get_listener_sock"
+    ],
+    "bpf_skc_lookup_tcp": [
+        "net/core/filter.c,bpf_skc_lookup_tcp"
+    ],
+    "bpf_tcp_check_syncookie": [
+        "net/core/filter.c,bpf_tcp_check_syncookie"
+    ],
+    "bpf_sysctl_get_name": [
+        "kernel/bpf/cgroup.c,bpf_sysctl_get_name"
+    ],
+    "bpf_sysctl_get_current_value": [
+        "kernel/bpf/cgroup.c,bpf_sysctl_get_current_value"
+    ],
+    "bpf_sysctl_get_new_value": [
+        "kernel/bpf/cgroup.c,bpf_sysctl_get_new_value"
+    ],
+    "bpf_sysctl_set_new_value": [
+        "kernel/bpf/cgroup.c,bpf_sysctl_set_new_value"
+    ],
+    "bpf_strtol": [
+        "kernel/bpf/helpers.c,bpf_strtol"
+    ],
+    "bpf_strtoul": [
+        "kernel/bpf/helpers.c,bpf_strtoul"
+    ],
+    "bpf_sk_storage_get": [
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_get",
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_get.cold",
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_get_tracing",
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_get_tracing.cold"
+    ],
+    "bpf_sk_storage_delete": [
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_delete",
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_delete.cold",
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_delete_tracing",
+        "net/core/bpf_sk_storage.c,bpf_sk_storage_delete_tracing.cold"
+    ],
+    "bpf_send_signal": [
+        "kernel/trace/bpf_trace.c,bpf_send_signal"
+    ],
+    "bpf_tcp_gen_syncookie": [
+        "net/core/filter.c,bpf_tcp_gen_syncookie"
+    ],
+    "bpf_skb_output": [
+        "net/core/filter.c,bpf_skb_event_output"
+    ],
+    "bpf_probe_read_user": [
+        "kernel/trace/bpf_trace.c,bpf_probe_read_user_dynptr",
+        "kernel/trace/bpf_trace.c,bpf_probe_read_user"
+    ],
+    "bpf_probe_read_kernel": [
+        "kernel/trace/bpf_trace.c,bpf_probe_read_kernel_dynptr",
+        "kernel/trace/bpf_trace.c,bpf_probe_read_kernel"
+    ],
+    "bpf_probe_read_user_str": [
+        "kernel/trace/bpf_trace.c,bpf_probe_read_user_str_dynptr",
+        "kernel/trace/bpf_trace.c,bpf_probe_read_user_str"
+    ],
+    "bpf_probe_read_kernel_str": [
+        "kernel/trace/bpf_trace.c,bpf_probe_read_kernel_str_dynptr",
+        "kernel/trace/bpf_trace.c,bpf_probe_read_kernel_str"
+    ],
+    "bpf_tcp_send_ack": [
+        "net/ipv4/bpf_tcp_ca.c,bpf_tcp_send_ack"
+    ],
+    "bpf_send_signal_thread": [
+        "kernel/trace/bpf_trace.c,bpf_send_signal_thread"
+    ],
+    "bpf_jiffies64": [
+        "kernel/bpf/helpers.c,bpf_jiffies64"
+    ],
+    "bpf_read_branch_records": [
+        "kernel/trace/bpf_trace.c,bpf_read_branch_records"
+    ],
+    "bpf_get_ns_current_pid_tgid": [
+        "kernel/bpf/helpers.c,bpf_get_ns_current_pid_tgid"
+    ],
+    "bpf_xdp_output": [
+        "net/core/filter.c,bpf_xdp_event_output"
+    ],
+    "bpf_get_netns_cookie": [
+        "kernel/bpf/cgroup.c,bpf_get_netns_cookie_sockopt",
+        "net/core/filter.c,bpf_get_netns_cookie_sock_ops",
+        "net/core/filter.c,bpf_get_netns_cookie_sock_addr",
+        "net/core/filter.c,bpf_get_netns_cookie_sock",
+        "net/core/filter.c,bpf_get_netns_cookie_sk_msg",
+        "net/core/filter.c,bpf_get_netns_cookie"
+    ],
+    "bpf_get_current_ancestor_cgroup_id": [
+        "kernel/bpf/helpers.c,bpf_get_current_ancestor_cgroup_id"
+    ],
+    "bpf_sk_assign": [
+        "net/core/filter.c,bpf_sk_assign",
+        "net/core/filter.c,bpf_sk_assign.cold"
+    ],
+    "bpf_ktime_get_boot_ns": [
+        "kernel/bpf/helpers.c,bpf_ktime_get_boot_ns"
+    ],
+    "bpf_seq_printf": [
+        "kernel/trace/bpf_trace.c,bpf_seq_printf"
+    ],
+    "bpf_seq_write": [
+        "kernel/trace/bpf_trace.c,bpf_seq_write"
+    ],
+    "bpf_sk_cgroup_id": [
+        "net/core/filter.c,bpf_sk_cgroup_id.cold",
+        "net/core/filter.c,bpf_sk_cgroup_id"
+    ],
+    "bpf_sk_ancestor_cgroup_id": [
+        "net/core/filter.c,bpf_sk_ancestor_cgroup_id",
+        "net/core/filter.c,bpf_sk_ancestor_cgroup_id.cold"
+    ],
+    "bpf_ringbuf_output": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_output"
+    ],
+    "bpf_ringbuf_reserve": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_reserve"
+    ],
+    "bpf_ringbuf_submit": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_submit"
+    ],
+    "bpf_ringbuf_discard": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_discard"
+    ],
+    "bpf_ringbuf_query": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_query"
+    ],
+    "bpf_csum_level": [
+        "net/core/filter.c,bpf_csum_level"
+    ],
+    "bpf_skc_to_tcp6_sock": [
+        "net/core/filter.c,bpf_skc_to_tcp6_sock",
+        "net/core/filter.c,bpf_skc_to_tcp6_sock.cold"
+    ],
+    "bpf_skc_to_tcp_sock": [
+        "net/core/filter.c,bpf_skc_to_tcp_sock",
+        "net/core/filter.c,bpf_skc_to_tcp_sock.cold"
+    ],
+    "bpf_skc_to_tcp_timewait_sock": [
+        "net/core/filter.c,bpf_skc_to_tcp_timewait_sock"
+    ],
+    "bpf_skc_to_tcp_request_sock": [
+        "net/core/filter.c,bpf_skc_to_tcp_request_sock"
+    ],
+    "bpf_skc_to_udp6_sock": [
+        "net/core/filter.c,bpf_skc_to_udp6_sock",
+        "net/core/filter.c,bpf_skc_to_udp6_sock.cold"
+    ],
+    "bpf_get_task_stack": [
+        "kernel/bpf/stackmap.c,bpf_get_task_stack_sleepable",
+        "kernel/bpf/stackmap.c,bpf_get_task_stack"
+    ],
+    "bpf_load_hdr_opt": [
+        "net/core/filter.c,bpf_sock_ops_load_hdr_opt"
+    ],
+    "bpf_store_hdr_opt": [
+        "net/core/filter.c,bpf_sock_ops_store_hdr_opt"
+    ],
+    "bpf_reserve_hdr_opt": [
+        "net/core/filter.c,bpf_sock_ops_reserve_hdr_opt"
+    ],
+    "bpf_inode_storage_get": [
+        "kernel/bpf/bpf_inode_storage.c,bpf_inode_storage_get"
+    ],
+    "bpf_inode_storage_delete": [
+        "kernel/bpf/bpf_inode_storage.c,bpf_inode_storage_delete"
+    ],
+    "bpf_d_path": [
+        "kernel/trace/bpf_trace.c,bpf_d_path_allowed",
+        "kernel/trace/bpf_trace.c,bpf_d_path"
+    ],
+    "bpf_copy_from_user": [
+        "kernel/bpf/helpers.c,bpf_copy_from_user"
+    ],
+    "bpf_snprintf_btf": [
+        "kernel/trace/bpf_trace.c,bpf_snprintf_btf"
+    ],
+    "bpf_seq_printf_btf": [
+        "kernel/trace/bpf_trace.c,bpf_seq_printf_btf"
+    ],
+    "bpf_skb_cgroup_classid": [
+        "net/core/filter.c,bpf_skb_cgroup_classid.cold",
+        "net/core/filter.c,bpf_skb_cgroup_classid"
+    ],
+    "bpf_redirect_neigh": [
+        "net/core/filter.c,bpf_redirect_neigh"
+    ],
+    "bpf_per_cpu_ptr": [
+        "kernel/bpf/helpers.c,bpf_per_cpu_ptr"
+    ],
+    "bpf_this_cpu_ptr": [
+        "kernel/bpf/helpers.c,bpf_this_cpu_ptr"
+    ],
+    "bpf_redirect_peer": [
+        "net/core/filter.c,bpf_redirect_peer"
+    ],
+    "bpf_task_storage_get": [
+        "kernel/bpf/bpf_task_storage.c,bpf_task_storage_get_recur",
+        "kernel/bpf/bpf_task_storage.c,bpf_task_storage_get"
+    ],
+    "bpf_task_storage_delete": [
+        "kernel/bpf/bpf_task_storage.c,bpf_task_storage_delete_recur",
+        "kernel/bpf/bpf_task_storage.c,bpf_task_storage_delete"
+    ],
+    "bpf_get_current_task_btf": [
+        "kernel/trace/bpf_trace.c,bpf_get_current_task_btf"
+    ],
+    "bpf_bprm_opts_set": [
+        "kernel/bpf/bpf_lsm.c,bpf_bprm_opts_set"
+    ],
+    "bpf_ktime_get_coarse_ns": [
+        "kernel/bpf/helpers.c,bpf_ktime_get_coarse_ns"
+    ],
+    "bpf_ima_inode_hash": [
+        "kernel/bpf/bpf_lsm.c,bpf_ima_inode_hash",
+        "kernel/bpf/bpf_lsm.c,bpf_ima_inode_hash_allowed"
+    ],
+    "bpf_sock_from_file": [
+        "net/core/filter.c,bpf_sock_from_file"
+    ],
+    "bpf_check_mtu": [
+        "net/core/filter.c,bpf_skb_check_mtu"
+    ],
+    "bpf_for_each_map_elem": [
+        "kernel/bpf/bpf_iter.c,bpf_for_each_map_elem"
+    ],
+    "bpf_snprintf": [
+        "kernel/bpf/helpers.c,bpf_snprintf"
+    ],
+    "bpf_sys_bpf": [
+        "kernel/bpf/syscall.c,bpf_sys_bpf"
+    ],
+    "bpf_btf_find_by_name_kind": [
+        "kernel/bpf/btf.c,bpf_btf_find_by_name_kind"
+    ],
+    "bpf_sys_close": [
+        "kernel/bpf/syscall.c,bpf_sys_close"
+    ],
+    "bpf_timer_init": [
+        "kernel/bpf/helpers.c,bpf_timer_init"
+    ],
+    "bpf_timer_set_callback": [
+        "kernel/bpf/helpers.c,bpf_timer_set_callback"
+    ],
+    "bpf_timer_start": [
+        "kernel/bpf/helpers.c,bpf_timer_start"
+    ],
+    "bpf_timer_cancel": [
+        "kernel/bpf/helpers.c,bpf_timer_cancel"
+    ],
+    "bpf_get_func_ip": [
+        "kernel/trace/bpf_trace.c,bpf_get_func_ip_uprobe_multi",
+        "kernel/trace/bpf_trace.c,bpf_get_func_ip_tracing",
+        "kernel/trace/bpf_trace.c,bpf_get_func_ip_kprobe_multi",
+        "kernel/trace/bpf_trace.c,bpf_get_func_ip_kprobe"
+    ],
+    "bpf_get_attach_cookie": [
+        "kernel/bpf/bpf_lsm.c,bpf_get_attach_cookie",
+        "kernel/trace/bpf_trace.c,bpf_get_attach_cookie_uprobe_multi",
+        "kernel/trace/bpf_trace.c,bpf_get_attach_cookie_tracing",
+        "kernel/trace/bpf_trace.c,bpf_get_attach_cookie_trace",
+        "kernel/trace/bpf_trace.c,bpf_get_attach_cookie_pe",
+        "kernel/trace/bpf_trace.c,bpf_get_attach_cookie_kprobe_multi"
+    ],
+    "bpf_task_pt_regs": [
+        "kernel/trace/bpf_trace.c,bpf_task_pt_regs"
+    ],
+    "bpf_get_branch_snapshot": [
+        "kernel/trace/bpf_trace.c,bpf_get_branch_snapshot"
+    ],
+    "bpf_trace_vprintk": [
+        "kernel/trace/bpf_trace.c,bpf_trace_vprintk"
+    ],
+    "bpf_skc_to_unix_sock": [
+        "net/core/filter.c,bpf_skc_to_unix_sock.cold",
+        "net/core/filter.c,bpf_skc_to_unix_sock"
+    ],
+    "bpf_kallsyms_lookup_name": [
+        "kernel/bpf/syscall.c,bpf_kallsyms_lookup_name"
+    ],
+    "bpf_find_vma": [
+        "kernel/bpf/task_iter.c,bpf_find_vma"
+    ],
+    "bpf_loop": [
+        "kernel/bpf/bpf_iter.c,bpf_loop"
+    ],
+    "bpf_strncmp": [
+        "kernel/bpf/helpers.c,bpf_strncmp"
+    ],
+    "bpf_get_func_arg": [
+        "kernel/trace/bpf_trace.c,get_func_arg"
+    ],
+    "bpf_get_func_ret": [
+        "kernel/trace/bpf_trace.c,get_func_ret"
+    ],
+    "bpf_get_func_arg_cnt": [
+        "kernel/trace/bpf_trace.c,get_func_arg_cnt"
+    ],
+    "bpf_get_retval": [
+        "kernel/bpf/cgroup.c,bpf_get_retval"
+    ],
+    "bpf_set_retval": [
+        "kernel/bpf/cgroup.c,bpf_set_retval"
+    ],
+    "bpf_xdp_get_buff_len": [
+        "net/core/filter.c,bpf_xdp_get_buff_len"
+    ],
+    "bpf_xdp_load_bytes": [
+        "net/core/filter.c,bpf_xdp_load_bytes"
+    ],
+    "bpf_xdp_store_bytes": [
+        "net/core/filter.c,bpf_xdp_store_bytes"
+    ],
+    "bpf_copy_from_user_task": [
+        "kernel/bpf/helpers.c,bpf_copy_from_user_task"
+    ],
+    "bpf_skb_set_tstamp": [
+        "net/core/filter.c,bpf_skb_set_tstamp"
+    ],
+    "bpf_ima_file_hash": [
+        "kernel/bpf/bpf_lsm.c,bpf_ima_file_hash"
+    ],
+    "bpf_kptr_xchg": [
+        "kernel/bpf/helpers.c,bpf_kptr_xchg"
+    ],
+    "bpf_map_lookup_percpu_elem": [
+        "kernel/bpf/helpers.c,bpf_map_lookup_percpu_elem"
+    ],
+    "bpf_skc_to_mptcp_sock": [
+        "net/core/filter.c,bpf_skc_to_mptcp_sock"
+    ],
+    "bpf_dynptr_from_mem": [
+        "kernel/bpf/helpers.c,bpf_dynptr_from_mem"
+    ],
+    "bpf_ringbuf_reserve_dynptr": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_reserve_dynptr"
+    ],
+    "bpf_ringbuf_submit_dynptr": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_submit_dynptr"
+    ],
+    "bpf_ringbuf_discard_dynptr": [
+        "kernel/bpf/ringbuf.c,bpf_ringbuf_discard_dynptr"
+    ],
+    "bpf_dynptr_read": [
+        "kernel/bpf/helpers.c,bpf_dynptr_read"
+    ],
+    "bpf_dynptr_write": [
+        "kernel/bpf/helpers.c,bpf_dynptr_write"
+    ],
+    "bpf_dynptr_data": [
+        "kernel/bpf/helpers.c,bpf_dynptr_data"
+    ],
+    "bpf_tcp_raw_gen_syncookie_ipv4": [
+        "net/core/filter.c,bpf_tcp_raw_gen_syncookie_ipv4"
+    ],
+    "bpf_tcp_raw_gen_syncookie_ipv6": [
+        "net/core/filter.c,bpf_tcp_raw_gen_syncookie_ipv6"
+    ],
+    "bpf_tcp_raw_check_syncookie_ipv4": [
+        "net/core/filter.c,bpf_tcp_raw_check_syncookie_ipv4"
+    ],
+    "bpf_tcp_raw_check_syncookie_ipv6": [
+        "net/core/filter.c,bpf_tcp_raw_check_syncookie_ipv6"
+    ],
+    "bpf_ktime_get_tai_ns": [
+        "kernel/bpf/helpers.c,bpf_ktime_get_tai_ns"
+    ],
+    "bpf_user_ringbuf_drain": [
+        "kernel/bpf/ringbuf.c,bpf_user_ringbuf_drain"
+    ],
+    "bpf_cgrp_storage_get": [
+        "kernel/bpf/bpf_cgrp_storage.c,bpf_cgrp_storage_get"
+    ],
+    "bpf_cgrp_storage_delete": [
+        "kernel/bpf/bpf_cgrp_storage.c,bpf_cgrp_storage_delete"
+    ]
+}

@@ -1,0 +1,32 @@
+myenv
+vm/image
+.vscode/settings.json
+
+# pdm
+.pdm.toml
+.pdm-python
+.pdm-build/
+
+# python
+__pycache__
+
+# qemu vm
+.port
+vm.log
+vm.pid
+bzImage*
+vmlinux*
+*.o
+poc*
+*.log
+gdb*
+.gdb_history
+
+# seeds
+initial_seeds
+seeds
+
+loop*
+output.json
+vm-*
+.venv
